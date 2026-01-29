@@ -31,9 +31,11 @@ st.set_page_config(
     layout="wide",
 )
 
-# 資料庫路徑
-DB_PATH = Path(__file__).parent / "news.db"
-FINANCE_DB_PATH = Path(__file__).parent / "finance.db"
+# 資料庫路徑 (優先使用完整資料庫，若不存在則使用示範資料庫)
+_base_path = Path(__file__).parent
+DB_PATH = _base_path / "news.db" if (_base_path / "news.db").exists() else _base_path / "demo_news.db"
+FINANCE_DB_PATH = _base_path / "finance.db" if (_base_path / "finance.db").exists() else _base_path / "demo_finance.db"
+DEMO_MODE = "demo" in str(DB_PATH)
 
 # 新聞分類關鍵字
 MACRO_KEYWORDS = {
@@ -4412,6 +4414,11 @@ def render_sentiment_backtest_page():
 # ========== 側邊欄 ==========
 st.sidebar.title("📈 股票與新聞分析")
 st.sidebar.markdown("---")
+
+# 示範模式提示
+if DEMO_MODE:
+    st.sidebar.info("📌 **示範模式**\n使用有限的示範數據")
+    st.toast("正在使用示範資料庫，數據有限", icon="ℹ️")
 
 # 檢查資料庫是否存在
 db_exists = DB_PATH.exists()

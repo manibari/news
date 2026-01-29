@@ -9,8 +9,13 @@ venv/
 .env
 
 # Database files (too large for git)
-*.db
+news.db
+finance.db
+macro.db
 *.sqlite
+
+# Allow demo databases
+!demo_*.db
 
 # Logs
 *.log
