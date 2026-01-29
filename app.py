@@ -4470,6 +4470,25 @@ else:
     st.sidebar.warning("資料庫中沒有新聞")
     selected_date = date.today()
 
+    # 顯示如何收集新聞的說明
+    st.warning("⚠️ 資料庫中沒有新聞數據")
+    st.info("""
+    **請先執行新聞收集：**
+
+    ```bash
+    # 收集今日新聞
+    python main.py
+
+    # 收集 PTT 歷史文章 (過去一年)
+    python collect_ptt_historical.py --pages 500
+
+    # 收集股票數據
+    python collect_stock_historical.py
+    ```
+
+    收集完成後重新整理頁面即可。
+    """)
+
 st.sidebar.markdown("---")
 
 # 市場週期燈號
