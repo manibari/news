@@ -752,12 +752,16 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
 @st.cache_resource
 def get_connection():
     """取得資料庫連接"""
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"新聞資料庫不存在: {DB_PATH}")
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
 @st.cache_resource
 def get_finance_connection():
     """取得金融資料庫連接"""
+    if not FINANCE_DB_PATH.exists():
+        raise FileNotFoundError(f"金融資料庫不存在: {FINANCE_DB_PATH}")
     return sqlite3.connect(FINANCE_DB_PATH, check_same_thread=False)
 
 
@@ -4409,9 +4413,36 @@ def render_sentiment_backtest_page():
 st.sidebar.title("📈 股票與新聞分析")
 st.sidebar.markdown("---")
 
+# 檢查資料庫是否存在
+db_exists = DB_PATH.exists()
+finance_db_exists = FINANCE_DB_PATH.exists()
+
+if not db_exists and not finance_db_exists:
+    st.error("⚠️ 資料庫檔案不存在")
+    st.info("""
+    **這是一個股票新聞分析系統，需要本地資料庫才能運行。**
+
+    請在本地環境執行以下步驟：
+
+    1. 安裝套件：`pip install -r requirements.txt`
+    2. 初始化新聞收集：`python main.py`
+    3. 初始化股票數據：`python finance_collector.py --init --fast`
+    4. 啟動應用：`streamlit run app.py`
+
+    **GitHub**: https://github.com/manibari/news
+    """)
+    st.stop()
+
 st.sidebar.subheader("📅 選擇日期")
 
-available_dates = get_available_dates()
+# 安全取得可用日期
+if db_exists:
+    try:
+        available_dates = get_available_dates()
+    except Exception:
+        available_dates = []
+else:
+    available_dates = []
 
 if available_dates:
     min_date = min(available_dates)
