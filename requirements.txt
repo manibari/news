@@ -1,10 +1,26 @@
+# 資料收集
 feedparser>=6.0.0
 requests>=2.28.0
 beautifulsoup4>=4.11.0
 python-dateutil>=2.8.0
 schedule>=1.2.0
+
+# Web UI
 streamlit>=1.30.0
+plotly>=5.0.0
+streamlit-authenticator>=0.3.0
+
+# 資料分析
 pandas>=2.0.0
+numpy>=1.24.0
+
+# 金融數據
 fredapi>=0.5.0
 yfinance>=0.2.0
-plotly>=5.0.0
+
+# 資料庫
+supabase>=2.0.0
+psycopg2-binary>=2.9.0
+
+# 環境設定
+python-dotenv>=1.0.0

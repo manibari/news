@@ -1,8 +1,14 @@
 """
 新聞瀏覽 & 股票數據 Streamlit 應用程式
+
+支援多種資料庫後端：
+- SQLite (DB_TYPE=sqlite)
+- PostgreSQL (DB_TYPE=postgresql)
+- Supabase (DB_TYPE=supabase)
 """
 
 import sqlite3
+import os
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -24,6 +30,198 @@ from src.finance.cycle_strategy import CycleBasedStrategySelector
 from src.finance.cycle_backtest import CycleBacktester
 from src.finance.sentiment_backtest import SentimentBacktester, DailyHotStocksAnalyzer
 
+# ==================== 資料層初始化 ====================
+# 使用統一的資料抽象層，透過 DB_TYPE 環境變數選擇後端
+from src.data import get_client, get_client_info
+
+# 延遲初始化資料客戶端
+DATA_CLIENT = None
+DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
+
+# 向後兼容：USE_SUPABASE 標誌
+USE_SUPABASE = DB_TYPE == "supabase"
+SUPABASE_CLIENT = None  # 不再直接使用，改用 DATA_CLIENT
+
+
+def _get_data_client():
+    """取得資料客戶端（延遲初始化）"""
+    global DATA_CLIENT
+    if DATA_CLIENT is None:
+        DATA_CLIENT = get_client()
+    return DATA_CLIENT
+
+# ==================== Supabase 快取層 ====================
+@st.cache_data(ttl=300)  # 快取 5 分鐘
+def _cached_supabase_news(date_str: str):
+    """快取新聞查詢 - 使用 collected_at 作為主要日期篩選"""
+    # 取得當天收集的新聞 (非 PTT)
+    result1 = SUPABASE_CLIENT.table("news").select(
+        "id, title, content, url, source, category, source_type, published_at, collected_at"
+    ).neq("source_type", "ptt").gte("collected_at", f"{date_str}T00:00:00").lte(
+        "collected_at", f"{date_str}T23:59:59"
+    ).limit(500).execute()
+
+    # 取得當天發布的 PTT 新聞
+    result2 = SUPABASE_CLIENT.table("news").select(
+        "id, title, content, url, source, category, source_type, published_at, collected_at"
+    ).eq("source_type", "ptt").gte("published_at", f"{date_str}T00:00:00").lte(
+        "published_at", f"{date_str}T23:59:59"
+    ).limit(200).execute()
+
+    # 合併並排序
+    all_news = (result1.data or []) + (result2.data or [])
+    all_news.sort(key=lambda x: x.get("collected_at") or x.get("published_at") or "", reverse=True)
+    return all_news
+
+@st.cache_data(ttl=300)
+def _cached_supabase_weekly_news(start_str: str, end_str: str):
+    """快取週新聞查詢 - 使用 collected_at 作為主要日期篩選"""
+    # 非 PTT: 用 collected_at
+    result1 = SUPABASE_CLIENT.table("news").select(
+        "id, title, content, url, source, category, source_type, published_at, collected_at"
+    ).neq("source_type", "ptt").gte("collected_at", start_str).lte(
+        "collected_at", f"{end_str}T23:59:59"
+    ).limit(1500).execute()
+
+    # PTT: 用 published_at
+    result2 = SUPABASE_CLIENT.table("news").select(
+        "id, title, content, url, source, category, source_type, published_at, collected_at"
+    ).eq("source_type", "ptt").gte("published_at", start_str).lte(
+        "published_at", f"{end_str}T23:59:59"
+    ).limit(500).execute()
+
+    all_news = (result1.data or []) + (result2.data or [])
+    all_news.sort(key=lambda x: x.get("collected_at") or x.get("published_at") or "", reverse=True)
+    return all_news
+
+@st.cache_data(ttl=600)  # 快取 10 分鐘
+def _cached_supabase_watchlist():
+    """快取股票清單"""
+    result = SUPABASE_CLIENT.table("watchlist").select(
+        "symbol, name, market, sector, industry"
+    ).eq("is_active", True).order("market").order("symbol").execute()
+    return result.data if result.data else []
+
+@st.cache_data(ttl=300)
+def _cached_supabase_prices(symbol: str, start_str: str, end_str: str):
+    """快取股價查詢"""
+    result = SUPABASE_CLIENT.table("daily_prices").select(
+        "date, open, high, low, close, volume"
+    ).eq("symbol", symbol).gte("date", start_str).lte("date", end_str).order("date").execute()
+    return result.data if result.data else []
+
+@st.cache_data(ttl=3600)  # 快取 1 小時
+def _cached_supabase_available_dates():
+    """快取可用日期 - 使用 collected_at"""
+    end_date = date.today()
+    start_date = end_date - timedelta(days=90)
+    result = SUPABASE_CLIENT.table("news").select("collected_at").gte(
+        "collected_at", start_date.isoformat()
+    ).order("collected_at", desc=True).limit(5000).execute()
+    dates_set = set()
+    for r in result.data or []:
+        if r.get("collected_at"):
+            dates_set.add(r["collected_at"][:10])
+    return sorted(dates_set, reverse=True)
+
+# ==================== 新聞篩選器 ====================
+# 社論/評論關鍵字 (標題中出現這些詞會被過濾)
+EDITORIAL_KEYWORDS = [
+    # 英文
+    "opinion", "editorial", "commentary", "column", "op-ed", "analysis:",
+    "perspective", "viewpoint", "my view", "i think", "in my opinion",
+    # 中文
+    "社論", "評論", "專欄", "觀點", "看法", "我認為", "個人觀點", "淺見",
+]
+
+# 不可靠來源 (這些來源的文章會被過濾)
+UNRELIABLE_SOURCES = [
+    # 可以根據需要添加
+]
+
+
+def extract_ptt_push_count(content: str) -> int:
+    """從 PTT 內容字串提取推文數
+
+    格式: "[推數] 作者: xxx" 或 "[爆] 作者: xxx" 或 "[X1] 作者: xxx"
+    """
+    if not content:
+        return 0
+
+    try:
+        # 取得 [] 內的內容
+        if "]" in content:
+            push_str = content.split("]")[0].replace("[", "").strip()
+
+            # 爆 = 100+ 推
+            if "爆" in push_str:
+                return 100
+
+            # X 開頭 = 負推 (噓)
+            if push_str.startswith("X"):
+                return -1
+
+            # 純數字
+            if push_str.isdigit():
+                return int(push_str)
+
+            # 空白或其他
+            return 0
+    except:
+        return 0
+
+    return 0
+
+
+def is_editorial_content(news: dict) -> bool:
+    """判斷是否為社論/評論類內容"""
+    title = (news.get("title") or "").lower()
+    source = (news.get("source") or "").lower()
+
+    # 檢查來源
+    if source in [s.lower() for s in UNRELIABLE_SOURCES]:
+        return True
+
+    # 檢查標題關鍵字
+    for keyword in EDITORIAL_KEYWORDS:
+        if keyword.lower() in title:
+            return True
+
+    return False
+
+
+def filter_news(news_list: list, ptt_min_push: int = 30, exclude_editorial: bool = True) -> list:
+    """過濾新聞列表
+
+    Args:
+        news_list: 新聞列表
+        ptt_min_push: PTT 最低推文數 (預設 30)
+        exclude_editorial: 是否排除社論/評論 (預設 True)
+
+    Returns:
+        過濾後的新聞列表
+    """
+    filtered = []
+
+    for news in news_list:
+        source_type = news.get("source_type") or ""
+
+        # PTT 文章：檢查推文數
+        if source_type == "ptt":
+            push_count = extract_ptt_push_count(news.get("content") or "")
+            if push_count < ptt_min_push:
+                continue
+
+        # 非 PTT 文章：檢查是否為社論
+        elif exclude_editorial:
+            if is_editorial_content(news):
+                continue
+
+        filtered.append(news)
+
+    return filtered
+
+
 # 頁面設定
 st.set_page_config(
     page_title="股票數據與新聞分析",
@@ -35,7 +233,7 @@ st.set_page_config(
 _base_path = Path(__file__).parent
 DB_PATH = _base_path / "news.db" if (_base_path / "news.db").exists() else _base_path / "demo_news.db"
 FINANCE_DB_PATH = _base_path / "finance.db" if (_base_path / "finance.db").exists() else _base_path / "demo_finance.db"
-DEMO_MODE = "demo" in str(DB_PATH)
+DEMO_MODE = not USE_SUPABASE and "demo" in str(DB_PATH)
 
 # 新聞分類關鍵字
 MACRO_KEYWORDS = {
@@ -211,15 +409,19 @@ POSITIVE_KEYWORDS = [
     "surge", "soar", "jump", "gain", "rise", "rally", "record high", "beat", "exceed",
     "growth", "profit", "boom", "optimis", "bullish", "upgrade", "strong", "recover",
     "success", "breakthrough", "expand", "increase", "positive", "better than expected",
-    "outperform", "upbeat", "confident", "improve", "advance", "climb"
+    "outperform", "upbeat", "confident", "improve", "advance", "climb",
+    # Fed/利率相關 - 降息對股市是利多
+    "rate cut", "cut rate", "cuts rate", "降息", "寬鬆", "dovish", "easing"
 ]
 
 NEGATIVE_KEYWORDS = [
     "plunge", "crash", "fall", "drop", "decline", "slump", "tumble", "sink", "lose",
-    "loss", "cut", "layoff", "fire", "recession", "crisis", "fear", "worry", "concern",
+    "loss", "layoff", "fire", "recession", "crisis", "fear", "worry", "concern",
     "pessimis", "bearish", "downgrade", "weak", "miss", "disappoint", "warn", "threat",
     "risk", "uncertain", "volatile", "trouble", "struggle", "fail", "worse than expected",
-    "shutdown", "default", "bankruptcy"
+    "shutdown", "default", "bankruptcy",
+    # Fed/利率相關 - 升息對股市是利空
+    "rate hike", "hike rate", "hikes rate", "升息", "緊縮", "hawkish", "tightening"
 ]
 
 
@@ -578,65 +780,99 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif event:
             return f"產業{event}消息，影響市場情緒"
 
-    # 總經類別使用專屬模板
+    # 總經類別使用專屬模板 - 區分「已宣布」vs「預期」
+
+    # 判斷是否為已確認事件（使用過去式或確認性動詞）
+    announced_words = ["holds", "held", "keeps", "kept", "announces", "announced",
+                       "decides", "decided", "maintains", "maintained", "unchanged"]
+    is_announced = any(w in text_all for w in announced_words)
 
     # Fed/利率
     if category == "Fed/利率":
-        if "hold" in text_all or "steady" in text_all or "unchanged" in text_all:
-            return "Fed 預期維持利率不變，市場觀望態度濃厚"
-        elif "cut" in text_all or "lower" in text_all:
-            return "市場預期降息，風險資產可能受惠"
+        # 利率維持不變
+        if any(w in text_all for w in ["hold", "steady", "unchanged", "pause"]):
+            if is_announced:
+                # 補充：Powell 繼任者相關新聞
+                if "successor" in text_all or "replace" in text_all or "candidate" in text_all:
+                    return "Fed 宣布維持利率不變；市場關注 Powell 繼任者人選"
+                return "Fed 宣布維持利率不變，暫停降息步調"
+            else:
+                return "市場預期 Fed 將維持利率不變"
+        # 降息
+        elif "cut" in text_all:
+            if is_announced or "cuts" in text_all:
+                return "Fed 宣布降息，寬鬆政策啟動"
+            else:
+                return "市場預期 Fed 將降息，風險資產可能受惠"
+        # 升息
         elif "hike" in text_all or "raise" in text_all:
-            return "升息預期升溫，債券殖利率走高"
+            if is_announced:
+                return "Fed 宣布升息，緊縮政策延續"
+            else:
+                return "升息預期升溫，債券殖利率走高"
         else:
-            return f"Fed 政策動向受關注：{top_news[:50]}..."
+            return "Fed 政策動態，持續關注利率走向"
 
     # 通膨
     elif category == "通膨":
-        if "ease" in text_all or "cool" in text_all or "slow" in text_all:
-            return "通膨降溫跡象，有利於寬鬆政策"
-        elif "rise" in text_all or "surge" in text_all or "hot" in text_all:
-            return "通膨壓力升溫，可能延後降息時程"
+        if "ease" in text_all or "cool" in text_all or "slow" in text_all or "fell" in text_all:
+            return "通膨數據降溫，有利於寬鬆政策預期"
+        elif "rise" in text_all or "surge" in text_all or "hot" in text_all or "sticky" in text_all:
+            return "通膨壓力仍存，可能延後降息時程"
+        elif "cpi" in text_all or "pce" in text_all:
+            return "通膨數據公布，關注物價趨勢"
         else:
-            return f"通膨動態：{top_news[:50]}..."
+            return "通膨相關消息，觀察物價走勢"
 
     # 就業
     elif category == "就業":
-        if "strong" in text_all or "add" in text_all or "hire" in text_all:
-            return "就業市場強勁，經濟基本面穩健"
-        elif "layoff" in text_all or "cut" in text_all or "job" in text_all and "loss" in text_all:
-            return "裁員消息頻傳，就業市場出現壓力"
+        if "strong" in text_all or "beats" in text_all or "added" in text_all:
+            return "就業數據強勁，勞動市場仍具韌性"
+        elif "layoff" in text_all or "layoffs" in text_all:
+            return "企業裁員消息頻傳，就業市場面臨壓力"
+        elif "jobless" in text_all or "unemployment" in text_all:
+            if "rise" in text_all or "higher" in text_all:
+                return "失業率上升，就業市場降溫"
+            elif "fall" in text_all or "low" in text_all:
+                return "失業率維持低檔，經濟基本面穩健"
         else:
-            return f"就業市場動態：{top_news[:50]}..."
+            return "就業市場消息，留意勞動數據"
 
     # 美元/匯率
     elif category == "美元/匯率":
         if "weak" in text_all or "fall" in text_all or "drop" in text_all or "slip" in text_all:
             return "美元走弱，新興市場與大宗商品受惠"
         elif "strong" in text_all or "rise" in text_all or "surge" in text_all:
-            return "美元走強，出口與新興市場承壓"
+            return "美元走強，出口企業與新興市場承壓"
         elif "intervention" in text_all:
-            return "匯市干預預期升溫，波動加劇"
+            return "匯市干預消息，波動加劇"
         else:
-            return f"匯率動態：{top_news[:50]}..."
+            return "匯率市場波動，關注美元走勢"
 
     # 黃金/避險
     elif category == "黃金/避險":
-        if "record" in text_all or "high" in text_all or "surge" in text_all:
-            return "黃金創新高，避險需求強勁"
-        elif "fall" in text_all or "drop" in text_all:
+        if "record" in text_all or "all-time" in text_all:
+            return "黃金創歷史新高，避險需求強勁"
+        elif "surge" in text_all or "jump" in text_all or "rally" in text_all:
+            return "黃金大漲，避險情緒升溫"
+        elif "fall" in text_all or "drop" in text_all or "retreat" in text_all:
             return "黃金回落，風險偏好回升"
         else:
-            return f"貴金屬動態：{top_news[:50]}..."
+            return "貴金屬市場波動，觀察避險情緒"
 
     # 貿易/關稅
     elif category == "貿易/關稅":
-        if "tariff" in text_all and ("raise" in text_all or "impose" in text_all or "threat" in text_all):
-            return "關稅威脅升級，貿易摩擦風險上升"
+        if "tariff" in text_all:
+            if "impose" in text_all or "announces" in text_all or "slaps" in text_all:
+                return "關稅政策實施，貿易摩擦升級"
+            elif "threat" in text_all or "warns" in text_all or "considers" in text_all:
+                return "關稅威脅升溫，市場關注後續發展"
+            elif "delay" in text_all or "pause" in text_all:
+                return "關稅暫緩，市場鬆一口氣"
         elif "deal" in text_all or "agreement" in text_all:
             return "貿易協議進展，市場情緒改善"
         else:
-            return f"貿易動態：{top_news[:50]}..."
+            return "貿易政策動態，留意關稅發展"
 
     # 政府政策
     elif category == "政府政策":
@@ -644,17 +880,21 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
             return "政府關門風險升高，市場不確定性增加"
         elif "stimulus" in text_all or "spending" in text_all:
             return "財政刺激政策動向，關注經濟影響"
+        elif "debt ceiling" in text_all or "debt limit" in text_all:
+            return "債務上限議題受關注，市場觀望"
         else:
-            return f"政策動態：{top_news[:50]}..."
+            return "政府政策動態，關注財政走向"
 
     # 債券
     elif category == "債券/殖利率":
-        if "rise" in text_all or "surge" in text_all or "climb" in text_all:
+        if "invert" in text_all or "inverted" in text_all:
+            return "殖利率曲線倒掛，衰退擔憂升溫"
+        elif "rise" in text_all or "surge" in text_all or "climb" in text_all or "jump" in text_all:
             return "殖利率上升，債券價格承壓"
-        elif "fall" in text_all or "drop" in text_all:
+        elif "fall" in text_all or "drop" in text_all or "retreat" in text_all:
             return "殖利率下滑，資金流向避險資產"
         else:
-            return f"債市動態：{top_news[:50]}..."
+            return "債券市場消息，留意殖利率變化"
 
     # GDP/經濟成長
     elif category == "GDP/經濟成長":
@@ -663,7 +903,7 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "growth" in text_all or "expand" in text_all:
             return "經濟成長穩健，支撐企業獲利預期"
         else:
-            return f"經濟動態：{top_news[:50]}..."
+            return "經濟數據更新，觀察成長動能"
 
     # 科技/AI
     elif category == "科技/AI":
@@ -674,7 +914,7 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "earn" in text_all:
             return "科技巨頭財報週，AI 支出成焦點"
         else:
-            return f"科技動態：{top_news[:50]}..."
+            return "科技產業消息，關注 AI 與雲端發展"
 
     # 醫療保健
     elif category == "醫療保健":
@@ -683,7 +923,7 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "fda" in text_all or "approv" in text_all:
             return "FDA 審批動態，藥廠股價波動"
         else:
-            return f"醫療動態：{top_news[:50]}..."
+            return "醫療產業消息，關注政策與新藥進展"
 
     # 汽車
     elif category == "汽車":
@@ -695,7 +935,7 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "tariff" in text_all:
             return "汽車業面臨關稅壓力，成本上升"
         else:
-            return f"汽車產業：{top_news[:50]}..."
+            return "汽車產業消息，關注電動車發展"
 
     # 航空/運輸
     elif category == "航空/運輸":
@@ -704,14 +944,14 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "earn" in text_all:
             return "運輸業財報公布，關注營運展望"
         else:
-            return f"運輸動態：{top_news[:50]}..."
+            return "運輸產業消息，留意物流與航運趨勢"
 
     # 金融/銀行
     elif category == "金融/銀行":
         if "earn" in text_all:
             return "銀行財報季，關注淨利差與信貸品質"
         else:
-            return f"金融動態：{top_news[:50]}..."
+            return "金融產業消息，關注銀行財報與利差"
 
     # 能源
     elif category == "能源":
@@ -720,7 +960,7 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "oil" in text_all and ("fall" in text_all or "drop" in text_all):
             return "油價下跌，通膨壓力緩解"
         else:
-            return f"能源動態：{top_news[:50]}..."
+            return "能源產業消息，關注油價走勢"
 
     # 零售/消費
     elif category == "零售/消費":
@@ -729,14 +969,14 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "weak" in text_all or "slow" in text_all:
             return "消費動能放緩，零售業承壓"
         else:
-            return f"零售動態：{top_news[:50]}..."
+            return "零售消費消息，觀察消費者信心"
 
     # 房地產
     elif category == "房地產":
         if "mortgage" in text_all and "rate" in text_all:
             return "房貸利率變動，影響購屋需求"
         else:
-            return f"房市動態：{top_news[:50]}..."
+            return "房地產消息，關注房貸利率影響"
 
     # 加密貨幣
     elif category == "加密貨幣":
@@ -745,15 +985,531 @@ def generate_summary(category: str, news_items: list, sentiment: str) -> str:
         elif "fall" in text_all or "drop" in text_all:
             return "加密貨幣回落，投資人轉趨保守"
         else:
-            return f"加密貨幣：{top_news[:50]}..."
+            return "加密貨幣市場波動，觀察市場情緒"
 
     # 預設
-    return f"{top_news[:60]}..."
+    return "相關消息更新，持續關注後續發展"
+
+
+def extract_specific_details(text: str, news_items: list) -> dict:
+    """
+    從新聞文字中提取具體細節（人名、數字、日期等）
+    """
+    import re
+    details = {
+        "people": [],
+        "percentages": [],
+        "countries": [],
+        "companies": [],
+        "dates": [],
+        "amounts": [],
+    }
+
+    # 提取人名（常見金融人物）
+    people_patterns = [
+        (r"(kevin\s+warsh|warsh)", "Kevin Warsh (華許)"),
+        (r"(jerome\s+powell|powell|鮑爾)", "Jerome Powell (鮑爾)"),
+        (r"(jensen\s+huang|黃仁勳)", "黃仁勳 (Jensen Huang)"),
+        (r"(trump|川普)", "川普"),
+        (r"(elon\s+musk|馬斯克)", "Elon Musk"),
+        (r"(魏哲家|c\.c\.\s*wei)", "魏哲家"),
+        (r"(劉德音)", "劉德音"),
+        (r"(蘇姿丰|lisa\s+su)", "蘇姿丰 (Lisa Su)"),
+    ]
+    for pattern, name in people_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            if name not in details["people"]:
+                details["people"].append(name)
+
+    # 提取百分比
+    pct_matches = re.findall(r'(\d+(?:\.\d+)?)\s*%', text)
+    details["percentages"] = list(set(pct_matches))
+
+    # 提取金額（億、兆）
+    amount_patterns = [
+        (r'(\d+(?:\.\d+)?)\s*兆', "兆"),
+        (r'(\d+(?:\.\d+)?)\s*億', "億"),
+        (r'\$(\d+(?:\.\d+)?)\s*(trillion|billion|million)', None),
+    ]
+    for pattern, unit in amount_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches and unit:
+            for m in matches:
+                details["amounts"].append(f"{m}{unit}")
+
+    # 提取國家（關稅相關）
+    country_patterns = [
+        (r"(china|中國|大陸)", "中國"),
+        (r"(canada|加拿大)", "加拿大"),
+        (r"(mexico|墨西哥)", "墨西哥"),
+        (r"(taiwan|台灣)", "台灣"),
+        (r"(japan|日本)", "日本"),
+        (r"(eu|european|歐盟|歐洲)", "歐盟"),
+    ]
+    for pattern, name in country_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            if name not in details["countries"]:
+                details["countries"].append(name)
+
+    # 提取公司名稱
+    company_patterns = [
+        (r"(nvidia|輝達)", "NVIDIA"),
+        (r"(tsmc|台積電)", "台積電"),
+        (r"(apple|蘋果)", "Apple"),
+        (r"(microsoft|微軟)", "Microsoft"),
+        (r"(google|alphabet|谷歌)", "Google"),
+        (r"(amazon|亞馬遜)", "Amazon"),
+        (r"(meta|臉書)", "Meta"),
+        (r"(tesla|特斯拉)", "Tesla"),
+        (r"(broadcom|博通)", "Broadcom"),
+        (r"(amd|超微)", "AMD"),
+    ]
+    for pattern, name in company_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            if name not in details["companies"]:
+                details["companies"].append(name)
+
+    # 提取月份/日期
+    date_patterns = [
+        (r"(january|一月|1月)", "1月"),
+        (r"(february|二月|2月)", "2月"),
+        (r"(march|三月|3月)", "3月"),
+        (r"(april|四月|4月)", "4月"),
+        (r"(may|五月|5月)", "5月"),
+        (r"(june|六月|6月)", "6月"),
+        (r"(july|七月|7月)", "7月"),
+        (r"(august|八月|8月)", "8月"),
+        (r"(september|九月|9月)", "9月"),
+        (r"(october|十月|10月)", "10月"),
+        (r"(november|十一月|11月)", "11月"),
+        (r"(december|十二月|12月)", "12月"),
+    ]
+    for pattern, name in date_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            if name not in details["dates"]:
+                details["dates"].append(name)
+
+    return details
+
+
+def generate_dual_summary(category: str, news_items: list) -> dict:
+    """
+    生成雙欄總結：確認事實 + 市場預期
+    Returns: {"facts": str, "expectations": str}
+    """
+    if not news_items:
+        return {"facts": "—", "expectations": "—"}
+
+    # 合併所有新聞文字
+    text_all = " ".join([(n["title"] + " " + (n["content"] or "")).lower() for n in news_items])
+    text_original = " ".join([(n["title"] + " " + (n["content"] or "")) for n in news_items])
+    top_news = news_items[0]["title"]
+
+    # 提取具體細節
+    details = extract_specific_details(text_original, news_items)
+
+    # 事實判斷詞（過去式、已確認）
+    fact_words = ["holds", "held", "keeps", "kept", "announces", "announced",
+                  "decides", "decided", "maintains", "maintained", "unchanged",
+                  "cuts", "raises", "raised", "rose", "fell", "dropped", "jumped",
+                  "reported", "posted", "beat", "missed", "surged", "plunged"]
+
+    # 預期判斷詞
+    expect_words = ["expected", "expects", "may", "might", "could", "likely",
+                    "forecast", "predict", "anticipate", "outlook", "guidance",
+                    "will", "would", "should", "plan", "plans", "consider"]
+
+    has_facts = any(w in text_all for w in fact_words)
+    has_expectations = any(w in text_all for w in expect_words)
+
+    facts = "—"
+    expectations = "—"
+
+    # ===== Fed/利率 =====
+    if category == "Fed/利率":
+        fact_parts = []
+
+        # 事實：利率決策
+        if any(w in text_all for w in ["holds", "held", "keeps", "kept", "maintains", "maintained"]):
+            if "rate" in text_all or "interest" in text_all:
+                fact_parts.append("Fed 宣布維持利率不變")
+        elif "cut" in text_all and any(w in text_all for w in ["announced", "cuts", "decided"]):
+            fact_parts.append("Fed 宣布降息")
+        elif "hike" in text_all or "raise" in text_all:
+            if any(w in text_all for w in ["announced", "raises", "raised"]):
+                fact_parts.append("Fed 宣布升息")
+
+        # 附加事實：Fed 主席繼任者
+        if "warsh" in text_all or "華許" in text_all:
+            if "nominate" in text_all or "提名" in text_all or "successor" in text_all:
+                nominee_info = "川普提名 Kevin Warsh (華許) 接任 Fed 主席"
+                if "5月" in text_original or "may" in text_all:
+                    nominee_info += "，預計5月鮑爾任期屆滿後接任"
+                fact_parts.append(nominee_info)
+        elif "successor" in text_all or "replace" in text_all or "candidate" in text_all or "繼任" in text_all:
+            fact_parts.append("Powell 繼任者議題浮現")
+
+        # 組合事實
+        if fact_parts:
+            facts = "；".join(fact_parts)
+
+        # 預期
+        if "pause" in text_all or "wait" in text_all:
+            expectations = "市場預期短期維持觀望"
+        elif "cut" in text_all and any(w in text_all for w in expect_words):
+            expectations = "市場預期未來可能降息"
+        elif "hike" in text_all and any(w in text_all for w in expect_words):
+            expectations = "市場預期可能再升息"
+        elif "data" in text_all or "inflation" in text_all:
+            expectations = "關注後續經濟數據走向"
+
+    # ===== 通膨 =====
+    elif category == "通膨":
+        if "cpi" in text_all or "pce" in text_all:
+            if "fell" in text_all or "dropped" in text_all or "eased" in text_all:
+                facts = "通膨數據下滑"
+            elif "rose" in text_all or "jumped" in text_all or "higher" in text_all:
+                facts = "通膨數據上升"
+            elif "reported" in text_all or "released" in text_all:
+                facts = "通膨數據公布"
+
+        if "sticky" in text_all or "persistent" in text_all:
+            expectations = "通膨黏性仍高，降息時程恐延後"
+        elif "ease" in text_all or "cool" in text_all:
+            expectations = "通膨有望持續降溫"
+        elif "target" in text_all:
+            expectations = "關注是否達成 2% 目標"
+
+    # ===== 就業 =====
+    elif category == "就業":
+        if "added" in text_all or "payroll" in text_all:
+            if "beat" in text_all or "strong" in text_all:
+                facts = "非農就業數據優於預期"
+            elif "miss" in text_all or "weak" in text_all:
+                facts = "非農就業數據不如預期"
+            else:
+                facts = "非農就業數據公布"
+        elif "layoff" in text_all or "layoffs" in text_all:
+            facts = "企業裁員消息頻傳"
+        elif "unemployment" in text_all:
+            if "rose" in text_all or "higher" in text_all:
+                facts = "失業率上升"
+            elif "fell" in text_all or "low" in text_all:
+                facts = "失業率維持低檔"
+
+        if "recession" in text_all:
+            expectations = "就業惡化恐加深衰退擔憂"
+        elif "soft landing" in text_all:
+            expectations = "軟著陸預期仍存"
+        elif "labor" in text_all and "tight" in text_all:
+            expectations = "勞動市場仍偏緊俏"
+
+    # ===== 貿易/關稅 =====
+    elif category == "貿易/關稅":
+        import re
+        fact_parts = []
+
+        # 提取國家與關稅百分比的配對
+        tariff_details = []
+        country_tariff_patterns = [
+            (r"china|中國|大陸", "中國"),
+            (r"canada|加拿大", "加拿大"),
+            (r"mexico|墨西哥", "墨西哥"),
+            (r"eu|european|歐盟|歐洲", "歐盟"),
+            (r"japan|日本", "日本"),
+            (r"taiwan|台灣", "台灣"),
+        ]
+
+        # 嘗試提取「國家 + 百分比」的關稅資訊
+        for pattern, country_name in country_tariff_patterns:
+            # 搜尋該國家附近的百分比
+            country_match = re.search(pattern, text_all, re.IGNORECASE)
+            if country_match:
+                # 在國家名稱前後 50 字元範圍內搜尋百分比
+                start = max(0, country_match.start() - 50)
+                end = min(len(text_all), country_match.end() + 50)
+                context = text_all[start:end]
+                pct_match = re.search(r'(\d+(?:\.\d+)?)\s*%', context)
+                if pct_match:
+                    tariff_details.append(f"{country_name} {pct_match.group(1)}%")
+
+        # 組合關稅細節
+        if tariff_details:
+            fact_parts.append("關稅現況：" + "、".join(tariff_details))
+        elif "impose" in text_all or "slaps" in text_all or "enacted" in text_all:
+            fact_parts.append("關稅政策已實施")
+        elif "announced" in text_all and "tariff" in text_all:
+            fact_parts.append("關稅措施宣布")
+        elif "delay" in text_all or "pause" in text_all:
+            fact_parts.append("關稅措施暫緩")
+
+        # 加入涉及的國家列表（如果沒有具體稅率）
+        if not tariff_details and details["countries"]:
+            fact_parts.append(f"涉及國家：{', '.join(details['countries'])}")
+
+        if fact_parts:
+            facts = "；".join(fact_parts)
+
+        # 預期
+        if "threat" in text_all or "warns" in text_all:
+            expectations = "更多關稅威脅可能出現"
+        elif "negotiat" in text_all or "talk" in text_all:
+            expectations = "貿易談判持續進行中"
+        elif "retaliat" in text_all:
+            expectations = "留意對方報復措施"
+        elif "escalat" in text_all:
+            expectations = "貿易戰可能升級"
+
+    # ===== AI/科技 =====
+    elif category == "AI/科技" or category == "科技" or category == "AI":
+        fact_parts = []
+
+        # 黃仁勳/NVIDIA 相關
+        if "黃仁勳" in text_original or "jensen huang" in text_all:
+            event_desc = "黃仁勳 (Jensen Huang)"
+            if "宴" in text_original or "dinner" in text_all or "banquet" in text_all:
+                event_desc = "黃仁勳舉辦兆元宴"
+                # 檢查與會者
+                attendees = []
+                if "魏哲家" in text_original or "c.c. wei" in text_all:
+                    attendees.append("台積電魏哲家")
+                if "劉德音" in text_original:
+                    attendees.append("劉德音")
+                if "供應鏈" in text_original or "supply chain" in text_all:
+                    event_desc += "，供應鏈大老齊聚"
+                elif attendees:
+                    event_desc += f"，{', '.join(attendees)}等出席"
+            elif "台北" in text_original or "taipei" in text_all:
+                event_desc += " 訪台"
+            fact_parts.append(event_desc)
+
+        # NVIDIA 財報/業績
+        if "nvidia" in text_all or "輝達" in text_original:
+            if "earnings" in text_all or "財報" in text_original:
+                if "beat" in text_all or "超預期" in text_original:
+                    fact_parts.append("NVIDIA 財報優於預期")
+                elif "miss" in text_all:
+                    fact_parts.append("NVIDIA 財報不如預期")
+                else:
+                    fact_parts.append("NVIDIA 財報發布")
+            if "guidance" in text_all or "財測" in text_original:
+                fact_parts.append("NVIDIA 發布財測指引")
+
+        # AI 產業動態
+        if "ai chip" in text_all or "ai 晶片" in text_original or "人工智慧晶片" in text_original:
+            fact_parts.append("AI 晶片需求相關消息")
+        if "data center" in text_all or "資料中心" in text_original:
+            fact_parts.append("資料中心需求持續")
+
+        # 其他科技公司
+        if details["companies"]:
+            companies_mentioned = [c for c in details["companies"] if c != "NVIDIA"]
+            if companies_mentioned and not fact_parts:
+                fact_parts.append(f"相關公司：{', '.join(companies_mentioned[:3])}")
+
+        if fact_parts:
+            facts = "；".join(fact_parts)
+        else:
+            facts = "AI/科技產業動態更新"
+
+        # 預期
+        if "demand" in text_all or "需求" in text_original:
+            expectations = "AI 相關需求持續看好"
+        elif "competition" in text_all or "競爭" in text_original:
+            expectations = "關注產業競爭態勢"
+        elif "supply" in text_all or "供應" in text_original:
+            expectations = "供應鏈狀況受關注"
+        else:
+            expectations = "持續關注 AI 產業發展"
+
+    # ===== 黃金/避險 =====
+    elif category == "黃金/避險":
+        if "record" in text_all or "all-time" in text_all:
+            facts = "黃金創歷史新高"
+        elif "surged" in text_all or "jumped" in text_all or "rallied" in text_all:
+            facts = "黃金大幅上漲"
+        elif "fell" in text_all or "dropped" in text_all:
+            facts = "黃金價格回落"
+
+        if "safe haven" in text_all or "geopolitical" in text_all:
+            expectations = "避險需求可能持續"
+        elif "dollar" in text_all:
+            expectations = "關注美元走勢影響"
+
+    # ===== 債券/殖利率 =====
+    elif category == "債券/殖利率":
+        if "invert" in text_all:
+            facts = "殖利率曲線倒掛"
+        elif "rose" in text_all or "jumped" in text_all or "climbed" in text_all:
+            facts = "殖利率上升"
+        elif "fell" in text_all or "dropped" in text_all:
+            facts = "殖利率下滑"
+
+        if "recession" in text_all:
+            expectations = "倒掛加深衰退擔憂"
+        elif "fed" in text_all:
+            expectations = "關注 Fed 政策影響"
+
+    # ===== 美元/匯率 =====
+    elif category == "美元/匯率":
+        if "rose" in text_all or "strengthened" in text_all or "surged" in text_all:
+            facts = "美元走強"
+        elif "fell" in text_all or "weakened" in text_all or "dropped" in text_all:
+            facts = "美元走弱"
+        elif "intervention" in text_all:
+            facts = "央行干預匯市"
+
+        if "emerging" in text_all:
+            expectations = "新興市場可能承壓"
+        elif "export" in text_all:
+            expectations = "出口企業受匯率影響"
+
+    # ===== GDP/經濟成長 =====
+    elif category == "GDP/經濟成長":
+        if "grew" in text_all or "expanded" in text_all:
+            facts = "GDP 正成長"
+        elif "contracted" in text_all or "shrank" in text_all:
+            facts = "GDP 負成長"
+        elif "reported" in text_all or "released" in text_all:
+            facts = "GDP 數據公布"
+
+        if "recession" in text_all:
+            expectations = "衰退風險受關注"
+        elif "soft landing" in text_all:
+            expectations = "軟著陸預期"
+        elif "growth" in text_all and any(w in text_all for w in expect_words):
+            expectations = "經濟成長展望審慎"
+
+    # ===== 政府政策 =====
+    elif category == "政府政策":
+        if "shutdown" in text_all:
+            if "avoid" in text_all or "avert" in text_all:
+                facts = "政府關門危機暫解"
+            else:
+                facts = "政府關門風險升高"
+        elif "pass" in text_all or "approved" in text_all:
+            facts = "政策法案通過"
+
+        if "debt" in text_all and "ceiling" in text_all:
+            expectations = "債務上限議題待解"
+        elif "stimulus" in text_all:
+            expectations = "財政刺激政策動向"
+
+    # ===== 個股/企業 =====
+    elif category == "個股/企業" or category == "企業" or category == "個股":
+        fact_parts = []
+
+        # 財報相關
+        if "earnings" in text_all or "財報" in text_original:
+            if "beat" in text_all or "超預期" in text_original or "優於" in text_original:
+                fact_parts.append("財報優於預期")
+            elif "miss" in text_all or "不如預期" in text_original:
+                fact_parts.append("財報不如預期")
+            else:
+                fact_parts.append("財報公布")
+
+        # 人事/活動
+        if details["people"]:
+            people_str = "、".join(details["people"][:3])
+            if "宴" in text_original or "dinner" in text_all or "banquet" in text_all:
+                fact_parts.append(f"{people_str}舉辦餐會活動")
+            elif "訪" in text_original or "visit" in text_all:
+                fact_parts.append(f"{people_str}出訪活動")
+            elif "會議" in text_original or "meeting" in text_all:
+                fact_parts.append(f"{people_str}參與會議")
+
+        # 公司動態
+        if details["companies"]:
+            companies_str = "、".join(details["companies"][:3])
+            if not fact_parts:
+                fact_parts.append(f"涉及公司：{companies_str}")
+
+        # 金額相關
+        if details["amounts"]:
+            amounts_str = "、".join(details["amounts"][:2])
+            fact_parts.append(f"涉及金額：{amounts_str}")
+
+        if fact_parts:
+            facts = "；".join(fact_parts)
+        else:
+            facts = "企業動態更新"
+
+        # 預期
+        if "guidance" in text_all or "財測" in text_original:
+            expectations = "關注後續財測指引"
+        elif "merger" in text_all or "acquisition" in text_all or "併購" in text_original:
+            expectations = "併購案後續發展"
+        elif "layoff" in text_all or "裁員" in text_original:
+            expectations = "關注企業營運狀況"
+        else:
+            expectations = "持續關注企業動態"
+
+    # ===== 通用處理（確保輸出中文）=====
+    # 各類別的預設中文描述
+    category_default_facts = {
+        "Fed/利率": "Fed 政策動態更新",
+        "通膨": "通膨相關數據發布",
+        "就業": "就業市場消息更新",
+        "貿易/關稅": "貿易政策動態",
+        "黃金/避險": "貴金屬市場波動",
+        "債券/殖利率": "債市行情變化",
+        "美元/匯率": "匯率市場動態",
+        "GDP/經濟成長": "經濟數據更新",
+        "政府政策": "政府政策動態",
+        "AI/科技": "AI/科技產業動態",
+        "科技": "科技產業動態",
+        "AI": "人工智慧產業動態",
+        "個股/企業": "企業動態更新",
+        "企業": "企業動態更新",
+        "個股": "個股動態更新",
+    }
+
+    category_default_expectations = {
+        "Fed/利率": "持續關注利率政策走向",
+        "通膨": "觀察通膨趨勢變化",
+        "就業": "留意勞動市場表現",
+        "貿易/關稅": "關注後續貿易發展",
+        "黃金/避險": "觀察避險情緒變化",
+        "債券/殖利率": "留意殖利率走勢",
+        "美元/匯率": "關注匯率波動影響",
+        "GDP/經濟成長": "觀察經濟成長動能",
+        "政府政策": "關注政策後續發展",
+        "AI/科技": "持續關注 AI 產業發展",
+        "科技": "持續關注科技產業發展",
+        "AI": "持續關注 AI 產業發展",
+        "個股/企業": "持續關注企業動態",
+        "企業": "持續關注企業動態",
+        "個股": "持續關注個股表現",
+    }
+
+    # 如果沒有匹配到具體事實，使用類別預設
+    if facts == "—" and has_facts:
+        facts = category_default_facts.get(category, "相關消息更新")
+
+    # 如果沒有匹配到具體預期，使用類別預設
+    if expectations == "—" and has_expectations:
+        if "outlook" in text_all or "guidance" in text_all:
+            expectations = "關注後續財測展望"
+        elif "earnings" in text_all:
+            expectations = "財報季持續關注"
+        else:
+            expectations = category_default_expectations.get(category, "持續觀察後續發展")
+
+    # 限制文字長度避免破版（最多 60 個字元）
+    max_len = 60
+    if len(facts) > max_len:
+        facts = facts[:max_len-1] + "…"
+    if len(expectations) > max_len:
+        expectations = expectations[:max_len-1] + "…"
+
+    return {"facts": facts, "expectations": expectations}
 
 
 @st.cache_resource
 def get_connection():
-    """取得資料庫連接"""
+    """取得新聞資料庫連接 (SQLite fallback)"""
+    if DB_TYPE != "sqlite":
+        return None  # 非 SQLite 不需要連接物件
     if not DB_PATH.exists():
         raise FileNotFoundError(f"新聞資料庫不存在: {DB_PATH}")
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -761,78 +1517,69 @@ def get_connection():
 
 @st.cache_resource
 def get_finance_connection():
-    """取得金融資料庫連接"""
+    """取得金融資料庫連接 (SQLite fallback)"""
+    if DB_TYPE != "sqlite":
+        return None  # 非 SQLite 不需要連接物件
     if not FINANCE_DB_PATH.exists():
         raise FileNotFoundError(f"金融資料庫不存在: {FINANCE_DB_PATH}")
     return sqlite3.connect(FINANCE_DB_PATH, check_same_thread=False)
 
 
 def get_watchlist():
-    """取得追蹤清單"""
-    conn = get_finance_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT symbol, name, market, sector, industry, description
-        FROM watchlist
-        WHERE is_active = 1
-        ORDER BY market, symbol
-    """)
-    columns = ["symbol", "name", "market", "sector", "industry", "description"]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    """取得追蹤清單 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        data = client.get_watchlist()
+        return [{"symbol": r["symbol"], "name": r.get("name", ""), "market": r.get("market", ""),
+                 "sector": r.get("sector", ""), "industry": r.get("industry", ""), "description": ""} for r in data]
+    except Exception as e:
+        st.error(f"取得追蹤清單失敗: {e}")
+        return []
 
 
 def get_stock_info(symbol: str):
-    """取得單一股票的詳細資訊"""
-    conn = get_finance_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT symbol, name, market, sector, industry, description
-        FROM watchlist
-        WHERE symbol = ?
-    """, (symbol,))
-    row = cursor.fetchone()
-    if row:
-        columns = ["symbol", "name", "market", "sector", "industry", "description"]
-        return dict(zip(columns, row))
-    return None
+    """取得單一股票的詳細資訊 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        watchlist = client.get_watchlist()
+        for r in watchlist:
+            if r.get("symbol") == symbol:
+                return {"symbol": r["symbol"], "name": r.get("name", ""), "market": r.get("market", ""),
+                        "sector": r.get("sector", ""), "industry": r.get("industry", ""), "description": ""}
+        return None
+    except Exception:
+        return None
 
 
 def get_stock_prices(symbol: str, start_date: date = None, end_date: date = None):
-    """取得股票價格數據"""
-    conn = get_finance_connection()
-    cursor = conn.cursor()
+    """取得股票價格數據 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        data = client.get_daily_prices(symbol, start_date=start_date, end_date=end_date)
 
-    query = """
-        SELECT date, open, high, low, close, volume
-        FROM daily_prices
-        WHERE symbol = ?
-    """
-    params = [symbol]
-
-    if start_date:
-        query += " AND date >= ?"
-        params.append(start_date.strftime("%Y-%m-%d"))
-    if end_date:
-        query += " AND date <= ?"
-        params.append(end_date.strftime("%Y-%m-%d"))
-
-    query += " ORDER BY date ASC"
-    cursor.execute(query, params)
-
-    columns = ["date", "open", "high", "low", "close", "volume"]
-    data = [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-    # 轉換為 DataFrame
-    if data:
-        df = pd.DataFrame(data)
-        df["date"] = pd.to_datetime(df["date"])
-        return df
-    return pd.DataFrame()
+        if data:
+            df = pd.DataFrame(data)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                # 按日期升序排列
+                df = df.sort_values("date").reset_index(drop=True)
+            return df
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"取得價格數據失敗: {e}")
+        return pd.DataFrame()
 
 
 def get_stock_fundamentals(symbol: str):
     """取得股票基本面數據"""
+    # 目前統一資料層尚未支援 fundamentals 查詢
+    # 當使用 PostgreSQL 時暫時返回 None
+    if DB_TYPE != "sqlite":
+        return None
+
     conn = get_finance_connection()
+    if not conn:
+        return None
     cursor = conn.cursor()
     cursor.execute("""
         SELECT * FROM fundamentals
@@ -849,10 +1596,7 @@ def get_stock_fundamentals(symbol: str):
 
 
 def get_news_for_stock(symbol: str, selected_date: date):
-    """取得與股票相關的新聞"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
+    """取得與股票相關的新聞 - 使用統一資料層"""
     # 建立搜尋關鍵字
     symbol_clean = symbol.replace(".TW", "").replace("^", "")
 
@@ -877,172 +1621,159 @@ def get_news_for_stock(symbol: str, selected_date: date):
 
     keywords = stock_keywords.get(symbol_clean, [symbol_clean.lower()])
 
-    # 搜尋新聞（PTT 用 published_at，其他用 collected_at）
-    date_str = selected_date.strftime("%Y-%m-%d")
-    all_news = []
+    try:
+        # 取得當天新聞，然後在 Python 中過濾關鍵字
+        news_list = get_news_by_date(selected_date)
+        all_news = []
 
-    for keyword in keywords:
-        cursor.execute("""
-            SELECT id, title, content, url, source, category, published_at
-            FROM news
-            WHERE ((source_type != 'ptt' AND date(collected_at) = ?)
-                   OR (source_type = 'ptt' AND date(published_at) = ?))
-            AND (LOWER(title) LIKE ? OR LOWER(content) LIKE ?)
-            ORDER BY published_at DESC
-        """, (date_str, date_str, f"%{keyword}%", f"%{keyword}%"))
+        for news in news_list:
+            title_lower = (news.get("title") or "").lower()
+            content_lower = (news.get("content") or "").lower()
+            text = title_lower + " " + content_lower
 
-        columns = ["id", "title", "content", "url", "source", "category", "published_at"]
-        news = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        all_news.extend(news)
+            for keyword in keywords:
+                if keyword.lower() in text:
+                    all_news.append(news)
+                    break
 
-    # 去重
-    seen_ids = set()
-    unique_news = []
-    for n in all_news:
-        if n["id"] not in seen_ids:
-            seen_ids.add(n["id"])
-            unique_news.append(n)
+        # 去重
+        seen_ids = set()
+        unique_news = []
+        for n in all_news:
+            news_id = n.get("id")
+            if news_id and news_id not in seen_ids:
+                seen_ids.add(news_id)
+                unique_news.append(n)
 
-    return unique_news
+        return unique_news
+    except Exception as e:
+        return []
 
 
 def get_news_in_date_range(start_date: date, end_date: date, keyword: str = None):
-    """取得日期範圍內的新聞（PTT 用 published_at，其他用 collected_at）"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
-
-    # 使用 CASE 來根據 source_type 選擇正確的日期欄位
-    query = """
-        SELECT news_date, COUNT(*) as count FROM (
-            SELECT CASE
-                WHEN source_type = 'ptt' THEN date(published_at)
-                ELSE date(collected_at)
-            END as news_date, title, content
-            FROM news
-            WHERE (source_type != 'ptt' AND date(collected_at) BETWEEN ? AND ?)
-               OR (source_type = 'ptt' AND date(published_at) BETWEEN ? AND ?)
+    """取得日期範圍內的新聞統計 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        news_list = client.get_news(
+            start_date=start_date,
+            end_date=end_date,
+            limit=5000
         )
-    """
-    params = [start_str, end_str, start_str, end_str]
 
-    if keyword:
-        query += " WHERE (LOWER(title) LIKE ? OR LOWER(content) LIKE ?)"
-        params.extend([f"%{keyword.lower()}%", f"%{keyword.lower()}%"])
+        date_counts = {}
+        for r in news_list:
+            # 過濾關鍵字
+            if keyword and keyword.lower() not in (r.get("title") or "").lower():
+                continue
 
-    query += " GROUP BY news_date ORDER BY news_date"
+            # 取得日期（優先使用 collected_at，fallback 到 published_at）
+            date_val = r.get("collected_at") or r.get("published_at") or ""
+            if date_val:
+                d = str(date_val)[:10]
+                date_counts[d] = date_counts.get(d, 0) + 1
 
-    cursor.execute(query, params)
-    return {row[0]: row[1] for row in cursor.fetchall()}
+        return date_counts
+    except Exception as e:
+        return {}
 
 
 def get_available_dates():
-    """取得有新聞的日期列表（整合 collected_at 和 published_at）"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    # 對非 PTT 來源使用 collected_at，對 PTT 使用 published_at
-    cursor.execute("""
-        SELECT DISTINCT news_date FROM (
-            SELECT date(collected_at) as news_date FROM news WHERE source_type != 'ptt'
-            UNION
-            SELECT date(published_at) as news_date FROM news WHERE source_type = 'ptt'
-        )
-        ORDER BY news_date DESC
-    """)
-    dates = [row[0] for row in cursor.fetchall()]
-    return [datetime.strptime(d, "%Y-%m-%d").date() for d in dates if d]
+    """取得有新聞的日期列表 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        # 取得最近 90 天的新聞來提取日期
+        end_date = date.today()
+        start_date = end_date - timedelta(days=90)
+        news_list = client.get_news(start_date=start_date, end_date=end_date, limit=5000)
+
+        dates_set = set()
+        for r in news_list:
+            date_val = r.get("collected_at") or r.get("published_at") or ""
+            if date_val:
+                dates_set.add(str(date_val)[:10])
+
+        dates = sorted(dates_set, reverse=True)
+        return [datetime.strptime(d, "%Y-%m-%d").date() for d in dates if d]
+    except Exception as e:
+        return []
 
 
 def get_ptt_available_dates():
-    """取得 PTT 有文章的日期列表"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT DISTINCT date(published_at) as news_date
-        FROM news
-        WHERE source_type = 'ptt' AND published_at IS NOT NULL
-        ORDER BY news_date DESC
-    """)
-    dates = [row[0] for row in cursor.fetchall()]
-    return [datetime.strptime(d, "%Y-%m-%d").date() for d in dates if d]
+    """取得 PTT 有文章的日期列表 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        # 取得最近 90 天的 PTT 新聞
+        end_date = date.today()
+        start_date = end_date - timedelta(days=90)
+        news_list = client.get_news(
+            start_date=start_date, end_date=end_date,
+            source="ptt", limit=5000
+        )
+
+        dates_set = set()
+        for r in news_list:
+            if r.get("source_type") == "ptt" and r.get("published_at"):
+                dates_set.add(str(r["published_at"])[:10])
+
+        dates = sorted(dates_set, reverse=True)
+        return [datetime.strptime(d, "%Y-%m-%d").date() for d in dates if d]
+    except Exception as e:
+        return []
 
 
 def get_news_by_date(selected_date: date):
-    """取得指定日期的新聞（PTT 用 published_at，其他用 collected_at）"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    date_str = selected_date.strftime("%Y-%m-%d")
-    # 對 PTT 使用 published_at，其他來源使用 collected_at
-    cursor.execute("""
-        SELECT id, title, content, url, source, category, source_type,
-               published_at, collected_at
-        FROM news
-        WHERE (source_type != 'ptt' AND date(collected_at) = ?)
-           OR (source_type = 'ptt' AND date(published_at) = ?)
-        ORDER BY COALESCE(published_at, collected_at) DESC
-    """, (date_str, date_str))
-    columns = ["id", "title", "content", "url", "source", "category",
-               "source_type", "published_at", "collected_at"]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    """取得指定日期的新聞 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        # 使用統一資料層的 get_news 方法
+        news_list = client.get_news(
+            start_date=selected_date,
+            end_date=selected_date,
+            limit=500
+        )
+        return news_list
+    except Exception as e:
+        st.error(f"取得新聞失敗: {e}")
+        return []
 
 
 def get_news_stats_by_date(selected_date: date):
-    """取得指定日期的新聞統計（PTT 用 published_at，其他用 collected_at）"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    date_str = selected_date.strftime("%Y-%m-%d")
+    """取得指定日期的新聞統計 - 使用統一資料層"""
+    try:
+        # 取得當日新聞並計算統計
+        news_list = get_news_by_date(selected_date)
 
-    # 條件：PTT 用 published_at，其他用 collected_at
-    date_condition = """
-        ((source_type != 'ptt' AND date(collected_at) = ?)
-         OR (source_type = 'ptt' AND date(published_at) = ?))
-    """
+        by_source_type = {}
+        by_source = {}
+        for r in news_list:
+            st = r.get("source_type") or "other"
+            by_source_type[st] = by_source_type.get(st, 0) + 1
+            s = r.get("source") or "unknown"
+            by_source[s] = by_source.get(s, 0) + 1
 
-    cursor.execute(f"SELECT COUNT(*) FROM news WHERE {date_condition}", (date_str, date_str))
-    total_count = cursor.fetchone()[0]
-
-    cursor.execute(f"""
-        SELECT source_type, COUNT(*) FROM news
-        WHERE {date_condition} GROUP BY source_type
-    """, (date_str, date_str))
-    by_source_type = dict(cursor.fetchall())
-
-    cursor.execute(f"""
-        SELECT source, COUNT(*) FROM news
-        WHERE {date_condition}
-        GROUP BY source ORDER BY COUNT(*) DESC LIMIT 10
-    """, (date_str, date_str))
-    by_source = dict(cursor.fetchall())
-
-    return {
-        "total_count": total_count,
-        "by_source_type": by_source_type,
-        "by_source": by_source,
-    }
+        return {
+            "total_count": len(news_list),
+            "by_source_type": by_source_type,
+            "by_source": dict(sorted(by_source.items(), key=lambda x: x[1], reverse=True)[:10]),
+        }
+    except Exception as e:
+        return {"total_count": 0, "by_source_type": {}, "by_source": {}}
 
 
 def get_weekly_news(end_date: date, days: int = 7) -> list:
-    """取得過去一週的新聞"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    start_date = end_date - timedelta(days=days)
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
-
-    cursor.execute("""
-        SELECT id, title, content, url, source, category, source_type,
-               published_at, collected_at
-        FROM news
-        WHERE (source_type != 'ptt' AND date(collected_at) BETWEEN ? AND ?)
-           OR (source_type = 'ptt' AND date(published_at) BETWEEN ? AND ?)
-        ORDER BY COALESCE(published_at, collected_at) DESC
-    """, (start_str, end_str, start_str, end_str))
-
-    columns = ["id", "title", "content", "url", "source", "category",
-               "source_type", "published_at", "collected_at"]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    """取得過去一週的新聞 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        start_date = end_date - timedelta(days=days)
+        news_list = client.get_news(
+            start_date=start_date,
+            end_date=end_date,
+            limit=2000
+        )
+        return news_list
+    except Exception as e:
+        st.error(f"取得週新聞失敗: {e}")
+        return []
 
 
 def categorize_news(news_list: list) -> dict:
@@ -1324,7 +2055,17 @@ def render_summary_page(selected_date: date):
     st.title("📊 新聞總結")
     st.markdown(f"**日期**: {selected_date.strftime('%Y-%m-%d')}")
 
-    news_list = get_news_by_date(selected_date)
+    # 取得新聞並套用篩選
+    raw_news = get_news_by_date(selected_date)
+    ptt_min = st.session_state.get("ptt_min_push", 30)
+    exclude_ed = st.session_state.get("exclude_editorial", True)
+    news_list = filter_news(raw_news, ptt_min_push=ptt_min, exclude_editorial=exclude_ed)
+
+    # 顯示篩選資訊
+    filtered_count = len(raw_news) - len(news_list)
+    if filtered_count > 0:
+        st.caption(f"🔍 已篩選: 原 {len(raw_news)} 篇 → {len(news_list)} 篇 (過濾 {filtered_count} 篇)")
+
     stats = get_news_stats_by_date(selected_date)
 
     if stats["total_count"] == 0:
@@ -1353,26 +2094,39 @@ def render_summary_page(selected_date: date):
     # 固定分類順序顯示
     macro_news = categorized["macro"]
 
-    # 總覽表格 - 固定順序
+    # 總覽表格 - 固定順序，分成事實與預期兩欄
     st.markdown("#### 快速總覽")
     overview_data = []
     for category in MACRO_KEYWORDS.keys():
         news_items = macro_news.get(category, [])
         if news_items:
             light, _ = analyze_sentiment(news_items)
-            summary = generate_summary(category, news_items, light)
+            dual = generate_dual_summary(category, news_items)
         else:
             light = "⚪"  # 無資料用灰色
-            summary = "今日無相關新聞"
+            dual = {"facts": "—", "expectations": "—"}
         overview_data.append({
             "燈號": light,
             "分類": category,
-            "總結": summary,
+            "📋 確認事實": dual["facts"],
+            "🔮 市場預期": dual["expectations"],
             "新聞數": len(news_items)
         })
 
     df_overview = pd.DataFrame(overview_data)
-    st.dataframe(df_overview, use_container_width=True, hide_index=True)
+    # 設定欄位寬度避免破版
+    st.dataframe(
+        df_overview,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "燈號": st.column_config.TextColumn("燈號", width="small"),
+            "分類": st.column_config.TextColumn("分類", width="small"),
+            "📋 確認事實": st.column_config.TextColumn("📋 確認事實", width="large"),
+            "🔮 市場預期": st.column_config.TextColumn("🔮 市場預期", width="medium"),
+            "新聞數": st.column_config.NumberColumn("新聞數", width="small"),
+        }
+    )
 
     st.markdown("#### 詳細內容")
     for category in MACRO_KEYWORDS.keys():
@@ -1389,8 +2143,9 @@ def render_summary_page(selected_date: date):
     st.header("🏭 產業板塊")
     st.caption("💡 總結基於過去一週新聞趨勢分析，避免單日新聞影響判斷")
 
-    # 取得過去一週新聞用於趨勢分析
-    weekly_news_list = get_weekly_news(selected_date, days=7)
+    # 取得過去一週新聞用於趨勢分析 (套用篩選)
+    raw_weekly = get_weekly_news(selected_date, days=7)
+    weekly_news_list = filter_news(raw_weekly, ptt_min_push=ptt_min, exclude_editorial=exclude_ed)
     weekly_categorized = categorize_news(weekly_news_list)
     weekly_industry_news = weekly_categorized["industry"]
 
@@ -1420,7 +2175,19 @@ def render_summary_page(selected_date: date):
         })
 
     df_overview = pd.DataFrame(overview_data)
-    st.dataframe(df_overview, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_overview,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "燈號": st.column_config.TextColumn("燈號", width="small"),
+            "分類": st.column_config.TextColumn("分類", width="small"),
+            "週趨勢": st.column_config.TextColumn("週趨勢", width="small"),
+            "總結": st.column_config.TextColumn("總結", width="large"),
+            "今日": st.column_config.NumberColumn("今日", width="small"),
+            "本週": st.column_config.NumberColumn("本週", width="small"),
+        }
+    )
 
     st.markdown("#### 詳細內容 (今日新聞)")
     col_left, col_right = st.columns(2)
@@ -1468,7 +2235,19 @@ def render_summary_page(selected_date: date):
         })
 
     df_overview = pd.DataFrame(overview_data)
-    st.dataframe(df_overview, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_overview,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "燈號": st.column_config.TextColumn("燈號", width="small"),
+            "分類": st.column_config.TextColumn("分類", width="small"),
+            "週趨勢": st.column_config.TextColumn("週趨勢", width="small"),
+            "總結": st.column_config.TextColumn("總結", width="large"),
+            "今日": st.column_config.NumberColumn("今日", width="small"),
+            "本週": st.column_config.NumberColumn("本週", width="small"),
+        }
+    )
 
     st.markdown("#### 詳細內容 (今日新聞)")
     # 使用三欄顯示（因為分類較多）
@@ -1530,10 +2309,19 @@ def render_news_list_page(selected_date: date):
     st.title("📰 新聞列表")
     st.markdown(f"**日期**: {selected_date.strftime('%Y-%m-%d')}")
 
-    news_list = get_news_by_date(selected_date)
+    # 取得新聞並套用篩選
+    raw_news = get_news_by_date(selected_date)
+    ptt_min = st.session_state.get("ptt_min_push", 30)
+    exclude_ed = st.session_state.get("exclude_editorial", True)
+    news_list = filter_news(raw_news, ptt_min_push=ptt_min, exclude_editorial=exclude_ed)
+
+    # 顯示篩選資訊
+    filtered_count = len(raw_news) - len(news_list)
+    if filtered_count > 0:
+        st.caption(f"🔍 已篩選: 原 {len(raw_news)} 篇 → {len(news_list)} 篇 (過濾 {filtered_count} 篇)")
 
     if not news_list:
-        st.warning(f"{selected_date} 沒有收集到新聞")
+        st.warning(f"{selected_date} 沒有符合篩選條件的新聞")
         return
 
     col1, col2 = st.columns(2)
@@ -1622,20 +2410,20 @@ def render_news_detail_page(selected_date: date):
 
 
 def get_ptt_news_by_date(selected_date: date):
-    """取得指定日期的 PTT 文章"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    date_str = selected_date.strftime("%Y-%m-%d")
-    cursor.execute("""
-        SELECT id, title, content, url, source, category, source_type,
-               published_at, collected_at
-        FROM news
-        WHERE date(published_at) = ? AND source_type = 'ptt'
-        ORDER BY published_at DESC
-    """, (date_str,))
-    columns = ["id", "title", "content", "url", "source", "category",
-               "source_type", "published_at", "collected_at"]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    """取得指定日期的 PTT 文章 - 使用統一資料層"""
+    try:
+        client = _get_data_client()
+        # 取得當天新聞並過濾 PTT
+        news_list = client.get_news(
+            start_date=selected_date,
+            end_date=selected_date,
+            limit=500
+        )
+        # 過濾出 PTT 文章
+        ptt_news = [n for n in news_list if n.get("source_type") == "ptt"]
+        return ptt_news
+    except Exception as e:
+        return []
 
 
 def render_ptt_page(selected_date: date):
@@ -1643,11 +2431,24 @@ def render_ptt_page(selected_date: date):
     st.title("🇹🇼 PTT Stock 版")
     st.markdown(f"**日期**: {selected_date.strftime('%Y-%m-%d')}")
 
-    ptt_news = get_ptt_news_by_date(selected_date)
+    raw_ptt = get_ptt_news_by_date(selected_date)
 
-    if not ptt_news:
+    if not raw_ptt:
         st.warning(f"{selected_date} 沒有 PTT 文章")
         st.info("提示：執行 `python main.py --once` 來收集 PTT 文章")
+        return
+
+    # 套用推文數篩選
+    ptt_min = st.session_state.get("ptt_min_push", 30)
+    ptt_news = filter_news(raw_ptt, ptt_min_push=ptt_min, exclude_editorial=False)
+
+    # 顯示篩選資訊
+    filtered_count = len(raw_ptt) - len(ptt_news)
+    if filtered_count > 0:
+        st.caption(f"🔍 已篩選: 原 {len(raw_ptt)} 篇 → {len(ptt_news)} 篇 (過濾推文數 < {ptt_min} 的 {filtered_count} 篇)")
+
+    if not ptt_news:
+        st.warning(f"沒有符合篩選條件的文章 (推文數 >= {ptt_min})")
         return
 
     # 統計
@@ -1657,7 +2458,7 @@ def render_ptt_page(selected_date: date):
         categories[cat] = categories.get(cat, 0) + 1
 
     # 顯示統計
-    st.markdown(f"共 **{len(ptt_news)}** 則文章")
+    st.markdown(f"共 **{len(ptt_news)}** 則文章 (推文數 >= {ptt_min})")
 
     cols = st.columns(len(categories))
     for i, (cat, count) in enumerate(sorted(categories.items(), key=lambda x: x[1], reverse=True)):
@@ -1719,6 +2520,2907 @@ def render_ptt_page(selected_date: date):
 
             if news["url"]:
                 st.link_button("🔗 前往 PTT 原文", news["url"])
+
+
+# ========== AI 趨勢雷達系統 ==========
+TECH_TRENDS = {
+    # ===== AI 運算層 =====
+    "GPU/AI晶片": {
+        "keywords": ["gpu", "nvidia", "h100", "h200", "b100", "b200", "blackwell", "rubin", "ai chip", "ai accelerator", "grace"],
+        "stocks": ["NVDA", "AMD", "INTC", "AVGO", "MRVL"],
+        "phase": "成熟期",
+        "detail": "Blackwell 量產中，Rubin 2026H2 試產",
+    },
+    "客製化AI晶片": {
+        "keywords": ["custom chip", "asic", "tpu", "trainium", "inferentia", "dojo", "willow"],
+        "stocks": ["AVGO", "MRVL", "GOOGL", "AMZN"],
+        "phase": "成長期",
+        "detail": "雲端大廠自研晶片，Broadcom/Marvell 代工",
+    },
+    # ===== 記憶體層 =====
+    "HBM記憶體": {
+        "keywords": ["hbm", "hbm3", "hbm3e", "hbm4", "high bandwidth memory"],
+        "stocks": ["MU", "SK Hynix", "Samsung"],
+        "phase": "爆發期",
+        "detail": "HBM4 2026Q1開始出貨，SK Hynix 市佔70%",
+    },
+    "DDR5/LPDDR5": {
+        "keywords": ["ddr5", "lpddr5", "memory module", "dram"],
+        "stocks": ["MU", "SK Hynix", "Samsung"],
+        "phase": "成熟期",
+        "detail": "伺服器換機潮帶動 DDR5 滲透",
+    },
+    # ===== 封裝層 =====
+    "先進封裝": {
+        "keywords": ["cowos", "advanced packaging", "chiplet", "2.5d", "3d packaging", "interposer", "soic", "emib", "foveros"],
+        "stocks": ["TSM", "ASX", "AMAT", "INTC"],
+        "phase": "爆發期",
+        "detail": "CoWoS 2026年底達 13萬片/月",
+    },
+    # ===== 互連層 =====
+    "矽光子/CPO": {
+        "keywords": ["silicon photonics", "optical interconnect", "co-packaged optics", "cpo", "photonic", "800g", "1.6t", "3.2t", "odin", "optical engine"],
+        "stocks": ["LITE", "COHR", "MRVL", "AVGO", "FN"],
+        "phase": "爆發期",
+        "detail": "1.6T量產，CPO從實驗轉向必備",
+    },
+    "高速連接器": {
+        "keywords": ["connector", "high speed", "pcie", "ubb", "nvlink", "ethernet switch"],
+        "stocks": ["APH", "TEL", "AVGO"],
+        "phase": "成長期",
+        "detail": "PCIe 6.0/NVLink 5 推動換代",
+    },
+    # ===== 散熱層 =====
+    "液冷散熱": {
+        "keywords": ["liquid cooling", "immersion cooling", "direct liquid", "cold plate", "coolant distribution"],
+        "stocks": ["VRT", "CARR", "JCI"],
+        "phase": "爆發期",
+        "detail": "1GW級資料中心標配液冷",
+    },
+    # ===== 電力層 =====
+    "電力基礎設施": {
+        "keywords": ["power infrastructure", "data center power", "electricity demand", "grid capacity", "power shortage", "ups", "pdu"],
+        "stocks": ["VST", "CEG", "PWR", "ETN", "EMR"],
+        "phase": "成長期",
+        "detail": "800V HVDC架構普及，電力成瓶頸",
+    },
+    "核能復興": {
+        "keywords": ["nuclear power", "nuclear energy", "smr", "small modular reactor", "uranium", "nuclear renaissance"],
+        "stocks": ["CEG", "VST", "CCJ", "NNE", "SMR"],
+        "phase": "早期",
+        "detail": "微軟/Google/Amazon 簽核電PPA",
+    },
+    # ===== 雲端/平台層 =====
+    "雲端AI服務": {
+        "keywords": ["azure ai", "aws", "google cloud", "openai", "anthropic", "cloud ai", "ai infrastructure", "ai spending", "capex"],
+        "stocks": ["MSFT", "GOOGL", "AMZN", "ORCL", "META"],
+        "phase": "爆發期",
+        "detail": "Hyperscaler AI CapEx 持續擴張",
+    },
+    "AI模型/平台": {
+        "keywords": ["chatgpt", "gpt-5", "gemini", "claude", "llama", "openai", "anthropic", "foundation model", "large language model", "llm"],
+        "stocks": ["MSFT", "GOOGL", "META", "AMZN"],
+        "phase": "成長期",
+        "detail": "GPT-5/Gemini 2.0 競爭白熱化",
+    },
+    "AI資料中心": {
+        "keywords": ["ai data center", "hyperscale", "colocation", "data center construction", "ai factory", "gpu cluster"],
+        "stocks": ["EQIX", "DLR", "AMT", "MSFT", "GOOGL"],
+        "phase": "爆發期",
+        "detail": "GW級AI資料中心大量興建",
+    },
+    # ===== 軟體/應用層 =====
+    "AI Agent": {
+        "keywords": ["ai agent", "autonomous agent", "agentic ai", "copilot", "mcp", "tool use"],
+        "stocks": ["MSFT", "GOOGL", "CRM", "NOW", "PATH"],
+        "phase": "成長期",
+        "detail": "2026年企業AI Agent大規模部署",
+    },
+    "企業AI應用": {
+        "keywords": ["enterprise ai", "ai saas", "ai software", "ai automation", "workflow ai", "ai analytics"],
+        "stocks": ["CRM", "NOW", "WDAY", "SNOW", "PLTR", "PATH"],
+        "phase": "成長期",
+        "detail": "企業AI軟體訂閱快速成長",
+    },
+    "邊緣AI": {
+        "keywords": ["edge ai", "on-device ai", "npu", "qualcomm ai", "apple intelligence", "ai pc", "ai phone"],
+        "stocks": ["QCOM", "AAPL", "ARM", "INTC", "AMD"],
+        "phase": "成長期",
+        "detail": "AI PC/Phone 換機潮啟動",
+    },
+    # ===== 設備層 =====
+    "半導體設備": {
+        "keywords": ["semiconductor equipment", "lithography", "euv", "high na", "etching", "deposition", "inspection"],
+        "stocks": ["ASML", "AMAT", "LRCX", "KLAC", "TOELY"],
+        "phase": "穩定期",
+        "detail": "High-NA EUV 2026量產",
+    },
+    # ===== 風險 =====
+    "地緣政治": {
+        "keywords": ["chip ban", "export control", "sanction", "china chip", "huawei", "tariff", "trade war", "entity list"],
+        "stocks": [],
+        "phase": "風險",
+        "detail": "美中科技戰持續，關稅風險",
+    },
+}
+
+# 關鍵股票詳細對照表
+STOCK_DETAILS = {
+    # GPU/AI晶片
+    "NVDA": {"name": "NVIDIA", "category": "GPU/AI晶片", "role": "AI晶片龍頭，Blackwell/Rubin架構"},
+    "AMD": {"name": "AMD", "category": "GPU/AI晶片", "role": "MI300X競爭者，CPU+GPU整合"},
+    "INTC": {"name": "Intel", "category": "GPU/AI晶片", "role": "Gaudi加速器，晶圓代工轉型"},
+    "AVGO": {"name": "Broadcom", "category": "客製化AI晶片", "role": "客製化AI晶片龍頭，Google TPU設計"},
+    "MRVL": {"name": "Marvell", "category": "客製化AI晶片", "role": "雲端客製晶片，收購Celestial AI"},
+    # 記憶體
+    "MU": {"name": "Micron", "category": "HBM記憶體", "role": "HBM3E供應商，美系唯一"},
+    # 封裝
+    "TSM": {"name": "TSMC", "category": "先進封裝", "role": "CoWoS/SoIC龍頭，AI封裝市佔80%+"},
+    "ASX": {"name": "ASE Technology", "category": "先進封裝", "role": "OSAT龍頭，2.5D/3D封裝"},
+    # 矽光子
+    "LITE": {"name": "Lumentum", "category": "矽光子/CPO", "role": "雷射/光學元件，CPO關鍵供應商"},
+    "COHR": {"name": "Coherent", "category": "矽光子/CPO", "role": "光學模組，800G/1.6T收發器"},
+    "FN": {"name": "Fabrinet", "category": "矽光子/CPO", "role": "光學設備代工"},
+    # 連接器
+    "APH": {"name": "Amphenol", "category": "高速連接器", "role": "高速連接器龍頭，AI伺服器必備"},
+    "TEL": {"name": "TE Connectivity", "category": "高速連接器", "role": "連接器/感測器"},
+    # 散熱
+    "VRT": {"name": "Vertiv", "category": "液冷散熱", "role": "資料中心液冷龍頭"},
+    "CARR": {"name": "Carrier Global", "category": "液冷散熱", "role": "HVAC/散熱系統"},
+    # 電力
+    "VST": {"name": "Vistra", "category": "電力基礎設施", "role": "電力公司，核能資產"},
+    "CEG": {"name": "Constellation Energy", "category": "核能復興", "role": "美國最大核電運營商"},
+    "PWR": {"name": "Quanta Services", "category": "電力基礎設施", "role": "電力基建工程"},
+    "ETN": {"name": "Eaton", "category": "電力基礎設施", "role": "電力管理，UPS/PDU"},
+    "CCJ": {"name": "Cameco", "category": "核能復興", "role": "鈾礦龍頭"},
+    "SMR": {"name": "NuScale Power", "category": "核能復興", "role": "SMR小型模組核電"},
+    # 設備
+    "ASML": {"name": "ASML", "category": "半導體設備", "role": "EUV光刻機獨佔"},
+    "AMAT": {"name": "Applied Materials", "category": "半導體設備", "role": "沉積/蝕刻設備"},
+    "LRCX": {"name": "Lam Research", "category": "半導體設備", "role": "蝕刻設備"},
+    "KLAC": {"name": "KLA", "category": "半導體設備", "role": "檢測設備"},
+    # 軟體
+    "MSFT": {"name": "Microsoft", "category": "AI Agent", "role": "Copilot生態系，Azure AI"},
+    "GOOGL": {"name": "Google", "category": "AI Agent", "role": "Gemini，TPU自研"},
+    "CRM": {"name": "Salesforce", "category": "AI Agent", "role": "Agentforce企業AI"},
+    "NOW": {"name": "ServiceNow", "category": "AI Agent", "role": "企業流程AI自動化"},
+    "PATH": {"name": "UiPath", "category": "企業AI應用", "role": "RPA/流程自動化龍頭"},
+    # 邊緣
+    "QCOM": {"name": "Qualcomm", "category": "邊緣AI", "role": "手機/PC NPU龍頭"},
+    "AAPL": {"name": "Apple", "category": "邊緣AI", "role": "Apple Intelligence生態"},
+    "ARM": {"name": "ARM Holdings", "category": "邊緣AI", "role": "CPU架構授權"},
+    # 雲端/平台
+    "AMZN": {"name": "Amazon", "category": "雲端AI服務", "role": "AWS雲端龍頭，Bedrock AI平台"},
+    "ORCL": {"name": "Oracle", "category": "雲端AI服務", "role": "OCI雲端，企業AI資料庫"},
+    "META": {"name": "Meta", "category": "AI模型/平台", "role": "Llama開源模型，AI廣告應用"},
+    # 資料中心
+    "EQIX": {"name": "Equinix", "category": "AI資料中心", "role": "全球最大資料中心REIT"},
+    "DLR": {"name": "Digital Realty", "category": "AI資料中心", "role": "資料中心REIT，Hyperscaler客戶"},
+    "AMT": {"name": "American Tower", "category": "AI資料中心", "role": "通訊塔/邊緣資料中心"},
+    # 企業軟體
+    "WDAY": {"name": "Workday", "category": "企業AI應用", "role": "HR/財務SaaS，AI助理"},
+    "SNOW": {"name": "Snowflake", "category": "企業AI應用", "role": "雲端資料倉儲，AI/ML平台"},
+    "PLTR": {"name": "Palantir", "category": "企業AI應用", "role": "AI數據分析平台，政府/企業"},
+    # ETF (用於2022防禦配置)
+    "XLE": {"name": "Energy Select ETF", "category": "ETF", "role": "能源板塊ETF"},
+    "XLF": {"name": "Financial Select ETF", "category": "ETF", "role": "金融板塊ETF"},
+    "XLV": {"name": "Health Care Select ETF", "category": "ETF", "role": "醫療板塊ETF"},
+    "XLU": {"name": "Utilities Select ETF", "category": "ETF", "role": "公用事業ETF"},
+    "SHY": {"name": "iShares 1-3Y Treasury", "category": "ETF", "role": "短期國債ETF"},
+    # 防禦股
+    "JPM": {"name": "JPMorgan Chase", "category": "金融", "role": "美國最大銀行"},
+    "JNJ": {"name": "Johnson & Johnson", "category": "醫療", "role": "醫療保健龍頭"},
+    "PG": {"name": "Procter & Gamble", "category": "必需消費", "role": "消費品龍頭"},
+    "COST": {"name": "Costco", "category": "必需消費", "role": "會員制零售"},
+}
+
+# 2026 Q1 技術預測
+Q1_2026_FORECAST = {
+    "GPU/AI晶片": {
+        "status": "🟢 量產",
+        "milestone": "Blackwell B200 全面量產，Rubin R100 進入試產",
+        "bottleneck": "CoWoS封裝產能仍緊",
+        "catalyst": "NVIDIA GTC 2026 (3月)",
+    },
+    "HBM記憶體": {
+        "status": "🔥 爆發",
+        "milestone": "HBM4 開始出貨，頻寬達 2TB/s",
+        "bottleneck": "HBM4 良率爬坡中",
+        "catalyst": "SK Hynix HBM4 量產宣布",
+    },
+    "先進封裝": {
+        "status": "🔥 爆發",
+        "milestone": "CoWoS月產能達10萬片，CoWoS-L量產",
+        "bottleneck": "ABF載板供應",
+        "catalyst": "TSMC法說會 (1月)",
+    },
+    "矽光子/CPO": {
+        "status": "🚀 轉折點",
+        "milestone": "1.6T模組量產，CPO從實驗轉必備",
+        "bottleneck": "InP雷射供應",
+        "catalyst": "OFC 2026 (3月)",
+    },
+    "液冷散熱": {
+        "status": "🟢 成長",
+        "milestone": "液冷滲透率達40%+",
+        "bottleneck": "客製化設計週期",
+        "catalyst": "新資料中心標案",
+    },
+    "電力基礎設施": {
+        "status": "⚠️ 瓶頸",
+        "milestone": "800V HVDC成新標準",
+        "bottleneck": "電網容量不足",
+        "catalyst": "核電PPA簽約消息",
+    },
+    "AI Agent": {
+        "status": "🌱 早期",
+        "milestone": "企業Agent大規模POC",
+        "bottleneck": "可靠性/安全性",
+        "catalyst": "微軟/Salesforce產品發布",
+    },
+    "雲端AI服務": {
+        "status": "🔥 爆發",
+        "milestone": "AI CapEx 達GDP佔比新高",
+        "bottleneck": "GPU供應/電力取得",
+        "catalyst": "Hyperscaler財報 (CapEx指引)",
+    },
+    "AI模型/平台": {
+        "status": "🟢 成長",
+        "milestone": "GPT-5/Gemini 2.0 發布，多模態標配",
+        "bottleneck": "訓練成本/算力需求",
+        "catalyst": "OpenAI/Google新模型發布",
+    },
+    "AI資料中心": {
+        "status": "🔥 爆發",
+        "milestone": "GW級AI園區動工，液冷標配",
+        "bottleneck": "電力/土地/許可證",
+        "catalyst": "新資料中心動工消息",
+    },
+    "企業AI應用": {
+        "status": "🟢 成長",
+        "milestone": "AI SaaS滲透率達15%+",
+        "bottleneck": "企業資料準備度",
+        "catalyst": "企業軟體財報 (AI營收佔比)",
+    },
+}
+
+SUPPLY_CHAIN_KEYWORDS = {
+    "短缺警示": ["shortage", "constraint", "bottleneck", "tight supply", "allocation", "lead time extend"],
+    "產能動態": ["capacity expansion", "new fab", "foundry", "utilization", "ramp up", "mass production"],
+    "價格變動": ["price hike", "price increase", "price cut", "asp", "margin pressure"],
+    "需求信號": ["strong demand", "order", "backlog", "booking", "guidance raise", "beat estimate"],
+}
+
+
+def analyze_trend_from_news(news_list: list) -> dict:
+    """分析新聞中的技術趨勢"""
+    from collections import defaultdict
+
+    daily_mentions = defaultdict(lambda: defaultdict(int))
+    total_mentions = defaultdict(int)
+
+    for news in news_list:
+        title = (news.get("title") or "").lower()
+        content = (news.get("content") or "").lower()
+        text = title + " " + content
+
+        pub_date = news.get("published_at") or news.get("collected_at") or ""
+        if pub_date:
+            date_str = pub_date[:10]
+        else:
+            continue
+
+        for trend_name, trend_info in TECH_TRENDS.items():
+            for keyword in trend_info["keywords"]:
+                if keyword.lower() in text:
+                    daily_mentions[date_str][trend_name] += 1
+                    total_mentions[trend_name] += 1
+                    break
+
+    # 計算動能
+    today = date.today()
+    recent_7d = set((today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7))
+    prev_7d = set((today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7, 14))
+
+    momentum = {}
+    for trend_name in TECH_TRENDS.keys():
+        recent = sum(daily_mentions[d][trend_name] for d in recent_7d)
+        prev = sum(daily_mentions[d][trend_name] for d in prev_7d)
+        change_pct = ((recent - prev) / prev * 100) if prev > 0 else (100 if recent > 0 else 0)
+        momentum[trend_name] = {"recent": recent, "prev": prev, "change_pct": change_pct, "total": total_mentions[trend_name]}
+
+    return {"daily_mentions": dict(daily_mentions), "momentum": momentum}
+
+
+def detect_supply_chain_alerts(news_list: list) -> list:
+    """偵測供應鏈警示"""
+    alerts = []
+    seen_titles = set()
+
+    for news in news_list:
+        title = news.get("title") or ""
+        if title in seen_titles:
+            continue
+
+        text = (title + " " + (news.get("content") or "")).lower()
+
+        for alert_type, keywords in SUPPLY_CHAIN_KEYWORDS.items():
+            for kw in keywords:
+                if kw in text:
+                    related = [t for t, info in TECH_TRENDS.items() if any(k in text for k in info["keywords"])]
+                    if related:
+                        seen_titles.add(title)
+                        alerts.append({
+                            "type": alert_type,
+                            "title": title,
+                            "date": (news.get("published_at") or "")[:10],
+                            "related": related,
+                            "url": news.get("url"),
+                        })
+                        break
+                break
+
+    return alerts[:30]
+
+
+def render_trend_radar_page():
+    """渲染趨勢雷達頁面"""
+    st.title("🎯 AI 趨勢雷達")
+    st.markdown("**追蹤 AI 產業鏈技術演進、供應鏈瓶頸與投資輪動**")
+
+    # 時間範圍選擇
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        time_range = st.selectbox(
+            "時間範圍",
+            ["1個月", "3個月", "6個月"],
+            index=2  # 預設6個月
+        )
+
+    days_map = {"1個月": 30, "3個月": 90, "6個月": 180}
+    days = days_map[time_range]
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+
+    # 取得新聞 - 使用統一資料層
+    @st.cache_data(ttl=1800)
+    def get_trend_news(start_str: str):
+        try:
+            client = _get_data_client()
+            start_dt = datetime.strptime(start_str, "%Y-%m-%d").date()
+            end_dt = date.today()
+            news_list = client.get_news(
+                start_date=start_dt,
+                end_date=end_dt,
+                limit=10000
+            )
+            return news_list
+        except Exception as e:
+            return []
+
+    raw_news = get_trend_news(start_date.isoformat())
+    if not raw_news:
+        st.warning("沒有足夠的新聞數據")
+        return
+
+    # 套用篩選
+    ptt_min = st.session_state.get("ptt_min_push", 30)
+    exclude_ed = st.session_state.get("exclude_editorial", True)
+    news_list = filter_news(raw_news, ptt_min_push=ptt_min, exclude_editorial=exclude_ed)
+
+    filtered_count = len(raw_news) - len(news_list)
+    filter_info = f" (已過濾 {filtered_count} 篇)" if filtered_count > 0 else ""
+    st.caption(f"📰 分析 {len(news_list)} 篇新聞 ({start_date} ~ {end_date}){filter_info}")
+
+    trend_data = analyze_trend_from_news(news_list)
+    momentum = trend_data["momentum"]
+
+    # ========== 熱度排行 ==========
+    st.header("🔥 趨勢熱度排行 (週變化)")
+
+    sorted_trends = sorted(momentum.items(), key=lambda x: x[1]["change_pct"], reverse=True)
+
+    cols = st.columns(4)
+    for i, (name, data) in enumerate(sorted_trends[:8]):
+        with cols[i % 4]:
+            change = data["change_pct"]
+            emoji = "🚀" if change > 50 else ("📈" if change > 0 else ("➡️" if change > -20 else "📉"))
+            phase = TECH_TRENDS[name]["phase"]
+            stocks = ", ".join(TECH_TRENDS[name]["stocks"][:2]) or "—"
+
+            st.metric(
+                label=f"{emoji} {name}",
+                value=f"{data['recent']} 則",
+                delta=f"{change:+.0f}% vs 上週",
+                help=f"階段: {phase} | 股票: {stocks}"
+            )
+
+    st.divider()
+
+    # ========== 趨勢時間線 ==========
+    st.header("📊 趨勢時間線")
+
+    selected = st.multiselect(
+        "選擇主題", list(TECH_TRENDS.keys()),
+        default=["GPU/AI晶片", "HBM記憶體", "矽光子/CPO", "電力基礎設施"]
+    )
+
+    if selected:
+        daily = trend_data["daily_mentions"]
+        dates = sorted(daily.keys())[-days:]  # 使用選擇的時間範圍
+
+        # 根據時間範圍調整移動平均窗口
+        window = 7 if days >= 90 else 3
+
+        fig = go.Figure()
+        for trend in selected:
+            vals = [daily.get(d, {}).get(trend, 0) for d in dates]
+            smoothed = pd.Series(vals).rolling(window, min_periods=1).mean()
+            fig.add_trace(go.Scatter(x=dates, y=smoothed, mode='lines', name=trend, line=dict(width=2)))
+
+        fig.update_layout(
+            height=500,
+            xaxis_title="日期",
+            yaxis_title=f"新聞提及數 ({window}日均線)",
+            legend=dict(orientation="h", y=1.1),
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 趨勢摘要
+        st.markdown("#### 📈 趨勢變化摘要")
+        # 計算各階段變化
+        if len(dates) >= 60:
+            mid_point = len(dates) // 2
+            first_half = dates[:mid_point]
+            second_half = dates[mid_point:]
+
+            summary_data = []
+            for trend in selected:
+                first_count = sum(daily.get(d, {}).get(trend, 0) for d in first_half)
+                second_count = sum(daily.get(d, {}).get(trend, 0) for d in second_half)
+                if first_count > 0:
+                    change = ((second_count - first_count) / first_count) * 100
+                else:
+                    change = 100 if second_count > 0 else 0
+
+                trend_direction = "📈 上升" if change > 20 else ("📉 下降" if change < -20 else "➡️ 持平")
+                summary_data.append({
+                    "主題": trend,
+                    "前半期": first_count,
+                    "後半期": second_count,
+                    "變化": f"{change:+.0f}%",
+                    "趨勢": trend_direction,
+                })
+
+            st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ========== 供應鏈警示 ==========
+    st.header("⚠️ 供應鏈警示")
+
+    alerts = detect_supply_chain_alerts(news_list)
+    if alerts:
+        alert_types = list(set(a["type"] for a in alerts))
+        tabs = st.tabs(alert_types)
+
+        for tab, atype in zip(tabs, alert_types):
+            with tab:
+                for a in [x for x in alerts if x["type"] == atype][:8]:
+                    st.markdown(f"**{a['date']}** | {', '.join(a['related'])}")
+                    if a.get("url"):
+                        st.markdown(f"[{a['title']}]({a['url']})")
+                    else:
+                        st.markdown(a['title'])
+                    st.markdown("---")
+    else:
+        st.info("暫無重大供應鏈警示")
+
+    st.divider()
+
+    # ========== 投資地圖 ==========
+    st.header("📋 AI 產業鏈投資地圖")
+
+    table_data = []
+    for name, info in TECH_TRENDS.items():
+        m = momentum.get(name, {})
+        table_data.append({
+            "主題": name,
+            "階段": info["phase"],
+            "近7天": m.get("recent", 0),
+            "週變化": f"{m.get('change_pct', 0):+.0f}%",
+            "相關股票": ", ".join(info["stocks"][:3]) or "—",
+        })
+
+    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+    with st.expander("📖 投資階段說明"):
+        st.markdown("""
+        | 階段 | 特徵 | 策略建議 |
+        |------|------|----------|
+        | 🌱 **早期** | 技術萌芽，提及數少但在上升 | 小部位佈局，高風險高報酬 |
+        | 📈 **成長期** | 技術驗證，需求快速增加 | 積極加碼，追蹤龍頭 |
+        | 🔥 **爆發期** | 供不應求，股價飆漲 | 核心持股，留意過熱 |
+        | 📊 **成熟期** | 技術普及，競爭加劇 | 選龍頭，留意毛利 |
+        | ⏸️ **穩定期** | 需求穩定，成長放緩 | 價值投資，領息 |
+        | ⚠️ **風險** | 地緣政治/監管風險 | 避險或觀望 |
+        """)
+
+    # ========== 2026 Q1 技術預測 ==========
+    st.header("🔮 2026 Q1 技術預測")
+
+    forecast_data = []
+    for tech, info in Q1_2026_FORECAST.items():
+        forecast_data.append({
+            "技術領域": tech,
+            "狀態": info["status"],
+            "里程碑": info["milestone"],
+            "瓶頸": info["bottleneck"],
+            "催化劑": info["catalyst"],
+        })
+
+    st.dataframe(pd.DataFrame(forecast_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ========== 關鍵股票對照表 ==========
+    st.header("📈 關鍵股票對照表")
+
+    # 按類別分組
+    categories = {}
+    for symbol, info in STOCK_DETAILS.items():
+        cat = info["category"]
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append({"代碼": symbol, "公司": info["name"], "角色": info["role"]})
+
+    # 選擇類別
+    selected_cat = st.selectbox("選擇技術領域", list(categories.keys()))
+
+    if selected_cat:
+        st.dataframe(pd.DataFrame(categories[selected_cat]), use_container_width=True, hide_index=True)
+
+        # 顯示相關趨勢
+        trend_info = TECH_TRENDS.get(selected_cat, {})
+        if trend_info:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("階段", trend_info.get("phase", "—"))
+            with col2:
+                st.metric("關鍵字", ", ".join(trend_info.get("keywords", [])[:5]))
+            if trend_info.get("detail"):
+                st.info(f"📌 {trend_info['detail']}")
+
+    st.divider()
+
+    # ========== 技術演進路線圖 ==========
+    with st.expander("🗺️ AI 技術演進路線圖 (2024-2027) - 含回測股票"):
+        st.markdown("""
+        ### 技術演進與對應股票
+
+        | 領域 | 2024 H1 | 2024 H2 | 2025 H1 | 2025 H2 | 2026 Q1 | 2026 H2 | 2027+ |
+        |------|---------|---------|---------|---------|---------|---------|-------|
+        | **GPU運算** | H100 | H200 | B100/B200(試產) | Blackwell(量產) | Blackwell(放量) | Rubin R100(試產) | R200 |
+        | 股票 | NVDA | NVDA, AMD | NVDA, AMD, AVGO | NVDA, AMD, AVGO | NVDA, AMD, MRVL | NVDA, AMD | NVDA |
+        | **記憶體** | HBM3 | HBM3E | HBM3E(供不應求) | HBM3E+HBM4試產 | HBM4量產 | HBM4E | HBM4+ |
+        | 股票 | MU | MU | MU | MU | MU | MU | MU |
+        | **先進封裝** | CoWoS-S(5萬片) | CoWoS-S(6萬片) | CoWoS-L(7.5萬片) | CoWoS-L(量產) | CoWoS-R(10萬片) | SoIC(13萬片) | 3D IC |
+        | 股票 | TSM, ASX | TSM, ASX | TSM, ASX | TSM, ASX | TSM, ASX | TSM, ASX | TSM |
+        | **光互連** | 400G | 800G(量產) | 800G(主流) | 1.6T(試產) | 1.6T量產+CPO | 3.2T | CPO標配 |
+        | 股票 | COHR | COHR, LITE | LITE, COHR, FN | LITE, COHR, MRVL | LITE, COHR, MRVL | LITE, MRVL | MRVL |
+        | **散熱** | 氣冷 | 氣冷+液冷 | 液冷(成長) | 液冷(爆發) | 液冷40%+ | 浸沒式 | 液冷標配 |
+        | 股票 | - | VRT | VRT, CARR | VRT, CARR | VRT | VRT | VRT |
+        | **電力** | 傳統電網 | 電力緊張 | 核電PPA | 800V HVDC | 電網瓶頸 | SMR佈局 | 核能+再生 |
+        | 股票 | - | VST, ETN | CEG, CCJ, VST | CEG, CCJ, ETN, PWR | CEG, CCJ, SMR | SMR, CEG | SMR |
+        | **雲端AI** | ChatGPT爆發 | AI CapEx啟動 | CapEx加速 | CapEx高峰 | CapEx持續 | 效率優化 | 下一波 |
+        | 股票 | MSFT, GOOGL | MSFT, AMZN, GOOGL | MSFT, AMZN, GOOGL, META | MSFT, AMZN, ORCL | MSFT, AMZN, ORCL | MSFT, GOOGL | - |
+        | **資料中心** | 傳統DC | AI DC規劃 | AI DC動工 | GW級園區 | 擴產加速 | 邊緣DC | 分散式 |
+        | 股票 | EQIX, DLR | EQIX, DLR | EQIX, DLR, AMT | EQIX, DLR | EQIX, DLR | AMT | - |
+        | **企業AI** | POC階段 | 試點部署 | 規模部署 | 營收貢獻 | AI佔比15%+ | 標配 | AI原生 |
+        | 股票 | - | CRM, NOW | CRM, NOW, PLTR | CRM, NOW, PLTR, WDAY | CRM, NOW, SNOW, PATH | 全部 | - |
+
+        ---
+
+        ### 📊 回測建議：各時期核心持股
+
+        | 時期 | 主題焦點 | 核心持股 | 輔助持股 |
+        |------|----------|----------|----------|
+        | **2024 H1** | GPU需求爆發 | NVDA | MSFT, GOOGL, TSM |
+        | **2024 H2** | 記憶體/封裝緊張 | NVDA, MU, TSM | COHR, VRT |
+        | **2025 H1** | 光互連崛起 | NVDA, LITE, TSM | MU, VRT, CEG |
+        | **2025 H2** | HBM4+CPO轉折 | MU, LITE, MRVL | NVDA, TSM, CEG |
+        | **2026 Q1** | 多元爆發 | LITE, MU, CEG | NVDA, VRT, CRM |
+        | **2026 H2** | 次世代佈局 | SMR, MRVL, NVDA | VRT, TSM, NOW |
+        """)
+
+    # ========== 投資主題摘要 ==========
+    with st.expander("💡 2026 Q1 投資主題摘要"):
+        st.markdown("""
+        ### 🔥 最熱門主題 (爆發期)
+
+        | 主題 | 核心邏輯 | 首選股票 |
+        |------|----------|----------|
+        | **HBM記憶體** | HBM4出貨啟動，SK Hynix市佔70% | MU, SK Hynix |
+        | **矽光子/CPO** | 1.6T量產，CPO從實驗變必備 | LITE, COHR, MRVL |
+        | **先進封裝** | CoWoS月產能翻倍，仍供不應求 | TSM, ASX |
+        | **液冷散熱** | 1GW級資料中心標配液冷 | VRT |
+
+        ### 🌱 早期佈局 (高風險高報酬)
+
+        | 主題 | 核心邏輯 | 首選股票 |
+        |------|----------|----------|
+        | **核能復興** | 科技巨頭簽核電PPA | CEG, CCJ, SMR |
+        | **AI Agent** | 企業Agent大規模部署元年 | CRM, NOW, MSFT |
+
+        ### ⚠️ 風險關注
+
+        | 風險 | 影響 | 應對 |
+        |------|------|------|
+        | **電力瓶頸** | 資料中心選址受限，電價上漲 | 關注電力股 VST, PWR |
+        | **關稅戰** | 半導體設備/零件成本上升 | 避免高中國曝險股 |
+        | **估值過高** | AI股整體估值偏高 | 分批佈局，留意回調 |
+        """)
+
+
+# ========== 季度持股池回測系統 ==========
+# 基於「季初可得資訊」的信號系統，避免後見之明
+
+# 季初信號定義（這些是每季開始時就能觀察到的）
+QUARTER_SIGNALS = {
+    "2022Q1": {
+        "fed_stance": "即將升息",      # 2021/12 Fed點陣圖顯示2022升息
+        "yield_curve": "正常但趨平",    # 10Y-2Y 約 0.8%
+        "cpi_trend": "上升 (7%)",       # 2021/12 CPI 7.0%
+        "spy_vs_200ma": "上方",         # SPY 在 200MA 上方
+        "vix": "中等 (17)",
+        "signal_score": 0.3,            # -1(極度防禦) 到 1(極度積極)
+    },
+    "2022Q2": {
+        "fed_stance": "激進升息中",     # 3月升息1碼，暗示加速
+        "yield_curve": "趨平",          # 10Y-2Y 接近 0
+        "cpi_trend": "加速 (8.5%)",     # 2022/03 CPI 8.5%
+        "spy_vs_200ma": "跌破",         # SPY 跌破 200MA
+        "vix": "偏高 (21)",
+        "signal_score": -0.3,
+    },
+    "2022Q3": {
+        "fed_stance": "持續鷹派",       # 6月升息3碼
+        "yield_curve": "倒掛",          # 10Y-2Y 轉負
+        "cpi_trend": "高峰 (9.1%)",     # 2022/06 CPI 9.1%
+        "spy_vs_200ma": "下方",
+        "vix": "偏高 (26)",
+        "signal_score": -0.5,
+    },
+    "2022Q4": {
+        "fed_stance": "鷹派但放緩",     # 持續升息但幅度可能減
+        "yield_curve": "倒掛",
+        "cpi_trend": "開始下滑 (8.2%)", # 2022/09 CPI 8.2%
+        "spy_vs_200ma": "下方",
+        "vix": "高 (31)",
+        "signal_score": -0.2,
+    },
+    "2023Q1": {
+        "fed_stance": "升息尾聲",       # 市場預期接近終點
+        "yield_curve": "深度倒掛",
+        "cpi_trend": "下滑 (6.5%)",
+        "spy_vs_200ma": "接近",
+        "vix": "下降 (21)",
+        "signal_score": 0.2,
+    },
+    "2023Q2": {
+        "fed_stance": "接近暫停",
+        "yield_curve": "倒掛",
+        "cpi_trend": "持續下滑 (5%)",
+        "spy_vs_200ma": "上方",         # 突破 200MA
+        "vix": "低 (17)",
+        "ai_momentum": "ChatGPT用戶破億", # 新信號：AI題材
+        "signal_score": 0.5,
+    },
+    "2023Q3": {
+        "fed_stance": "暫停觀望",
+        "yield_curve": "倒掛",
+        "cpi_trend": "下滑 (3.2%)",
+        "spy_vs_200ma": "上方",
+        "vix": "低 (14)",
+        "ai_momentum": "NVDA財報超預期",
+        "signal_score": 0.6,
+    },
+    "2023Q4": {
+        "fed_stance": "暫停，降息預期",
+        "yield_curve": "倒掛收窄",
+        "cpi_trend": "穩定 (3.7%)",
+        "spy_vs_200ma": "上方",
+        "vix": "低 (17)",
+        "ai_momentum": "AI CapEx確認增加",
+        "signal_score": 0.7,
+    },
+    "2024Q1": {
+        "fed_stance": "維持，等待降息",
+        "yield_curve": "倒掛收窄",
+        "cpi_trend": "穩定 (3.4%)",
+        "spy_vs_200ma": "上方",
+        "vix": "低 (13)",
+        "ai_momentum": "Hyperscaler CapEx指引強勁",
+        "signal_score": 0.7,
+    },
+    "2024Q2": {
+        "fed_stance": "維持觀望",
+        "yield_curve": "倒掛",
+        "cpi_trend": "略升 (3.5%)",
+        "spy_vs_200ma": "上方",
+        "vix": "低 (13)",
+        "ai_momentum": "HBM供不應求",
+        "signal_score": 0.6,
+    },
+    "2024Q3": {
+        "fed_stance": "即將降息",
+        "yield_curve": "倒掛收窄",
+        "cpi_trend": "下滑 (2.9%)",
+        "spy_vs_200ma": "上方",
+        "vix": "中等 (15)",
+        "ai_momentum": "800G量產，光互連題材",
+        "signal_score": 0.6,
+    },
+    "2024Q4": {
+        "fed_stance": "降息開始",
+        "yield_curve": "正常化",
+        "cpi_trend": "穩定 (2.6%)",
+        "spy_vs_200ma": "上方",
+        "vix": "中等 (16)",
+        "ai_momentum": "核電PPA簽約，電力瓶頸",
+        "signal_score": 0.5,
+    },
+    "2025Q1": {
+        "fed_stance": "降息暫停",       # 1月Fed維持利率
+        "yield_curve": "正常",
+        "cpi_trend": "略升 (2.9%)",
+        "spy_vs_200ma": "跌破後反彈",   # 1月底跌破，2月反彈
+        "vix": "飆升 (16→28)",          # DeepSeek後VIX飆升至28
+        "ai_momentum": "DeepSeek衝擊，AI估值重估",
+        "tariff_risk": "川普關稅威脅升級",
+        "signal_score": -0.3,           # 熊市信號！
+    },
+    # ===== 以下為未來預測 (假設情境) =====
+    "2025Q2": {
+        "fed_stance": "觀望",
+        "yield_curve": "正常",
+        "cpi_trend": "待觀察",
+        "spy_vs_200ma": "待觀察",
+        "vix": "待觀察 (關稅談判)",
+        "ai_momentum": "關稅影響待釐清",
+        "tariff_risk": "關稅談判進行中",
+        "signal_score": -0.1,           # 仍偏保守
+    },
+    "2025Q3": {
+        "fed_stance": "可能降息",
+        "yield_curve": "正常",
+        "cpi_trend": "穩定",
+        "spy_vs_200ma": "待觀察",
+        "vix": "待觀察",
+        "ai_momentum": "HBM4量產",
+        "signal_score": 0.5,
+    },
+    "2025Q4": {
+        "fed_stance": "寬鬆週期",
+        "yield_curve": "正常",
+        "cpi_trend": "穩定",
+        "spy_vs_200ma": "待觀察",
+        "vix": "待觀察",
+        "ai_momentum": "AI全面滲透",
+        "signal_score": 0.5,
+    },
+    "2026Q1": {
+        "fed_stance": "寬鬆",
+        "yield_curve": "正常",
+        "cpi_trend": "穩定",
+        "spy_vs_200ma": "待觀察",
+        "vix": "待觀察",
+        "ai_momentum": "Rubin預熱",
+        "signal_score": 0.5,
+    },
+}
+
+def get_allocation_from_signal(signal_score: float, ai_momentum: bool = False) -> dict:
+    """根據信號分數決定配置風格
+
+    signal_score: -1 (極度防禦) 到 1 (極度積極)
+    """
+    if signal_score <= -0.5:
+        # 極度防禦
+        return {"style": "極度防禦", "equity": 0.40, "defensive": 0.40, "bond": 0.20}
+    elif signal_score <= -0.2:
+        # 防禦
+        return {"style": "防禦", "equity": 0.55, "defensive": 0.30, "bond": 0.15}
+    elif signal_score <= 0.2:
+        # 中性
+        return {"style": "中性", "equity": 0.70, "defensive": 0.20, "bond": 0.10}
+    elif signal_score <= 0.5:
+        # 積極
+        return {"style": "積極", "equity": 0.85, "defensive": 0.10, "bond": 0.05}
+    else:
+        # 極度積極
+        return {"style": "極度積極", "equity": 0.95, "defensive": 0.05, "bond": 0.00}
+
+
+# 基於季初信號的持股配置
+QUARTERLY_PORTFOLIOS = {
+    # ===== 2022 年 =====
+    "2022Q1": {
+        "name": "升息預期啟動",
+        "signal": "Fed點陣圖顯示升息，CPI 7%，但SPY仍在200MA上",
+        "start": "2022-01-01",
+        "end": "2022-03-31",
+        "holdings": {
+            # signal_score: 0.3 (中性偏積極)
+            "XLE": 0.20,    # 通膨受惠
+            "XLF": 0.15,    # 升息受惠
+            "MSFT": 0.15,
+            "AAPL": 0.15,
+            "GOOGL": 0.12,
+            "XLV": 0.12,    # 部分防禦
+            "JPM": 0.11,
+        },
+    },
+    "2022Q2": {
+        "name": "SPY跌破200MA",
+        "signal": "SPY跌破200MA，CPI加速至8.5%，Fed升息加速",
+        "start": "2022-04-01",
+        "end": "2022-06-30",
+        "holdings": {
+            # signal_score: -0.3 (防禦)
+            "XLE": 0.25,    # 能源通膨受惠
+            "XLV": 0.20,    # 防禦
+            "XLU": 0.15,    # 防禦
+            "XLF": 0.15,    # 升息受惠
+            "COST": 0.13,   # 必需消費
+            "JNJ": 0.12,
+        },
+    },
+    "2022Q3": {
+        "name": "殖利率倒掛確認",
+        "signal": "10Y-2Y倒掛，CPI達9.1%高峰，VIX 26",
+        "start": "2022-07-01",
+        "end": "2022-09-30",
+        "holdings": {
+            # signal_score: -0.5 (極度防禦)
+            "XLE": 0.20,
+            "XLV": 0.20,
+            "XLU": 0.20,
+            "SHY": 0.15,    # 短債避險
+            "COST": 0.13,
+            "PG": 0.12,
+        },
+    },
+    "2022Q4": {
+        "name": "CPI見頂信號",
+        "signal": "CPI從9.1%降至8.2%，通膨可能見頂",
+        "start": "2022-10-01",
+        "end": "2022-12-31",
+        "holdings": {
+            # signal_score: -0.2 (防禦但開始試探)
+            "XLE": 0.18,
+            "XLV": 0.15,
+            "XLF": 0.12,
+            "MSFT": 0.12,
+            "AAPL": 0.12,
+            "GOOGL": 0.10,
+            "XLU": 0.10,
+            "AMZN": 0.11,
+        },
+    },
+    # ===== 2023 年 =====
+    "2023Q1": {
+        "name": "升息尾聲預期",
+        "signal": "CPI降至6.5%，市場預期Fed接近終點",
+        "start": "2023-01-01",
+        "end": "2023-03-31",
+        "holdings": {
+            # signal_score: 0.2 (中性)
+            "MSFT": 0.18,   # ChatGPT題材 (2022/11上線)
+            "NVDA": 0.15,   # GPU需求預期
+            "GOOGL": 0.15,
+            "META": 0.12,   # 效率年題材
+            "AAPL": 0.12,
+            "XLV": 0.15,    # 維持防禦
+            "AMZN": 0.13,
+        },
+    },
+    "2023Q2": {
+        "name": "AI需求確認",
+        "signal": "SPY突破200MA，ChatGPT用戶破億，NVDA指引超預期",
+        "start": "2023-04-01",
+        "end": "2023-06-30",
+        "holdings": {
+            # signal_score: 0.5 (積極)
+            "NVDA": 0.28,
+            "MSFT": 0.18,
+            "AMD": 0.12,
+            "GOOGL": 0.12,
+            "META": 0.10,
+            "TSM": 0.10,
+            "XLV": 0.10,    # 少量防禦
+        },
+    },
+    "2023Q3": {
+        "name": "AI CapEx確認",
+        "signal": "Hyperscaler財報確認AI投資，VIX 14低檔",
+        "start": "2023-07-01",
+        "end": "2023-09-30",
+        "holdings": {
+            # signal_score: 0.6 (積極)
+            "NVDA": 0.28,
+            "MSFT": 0.18,
+            "AMD": 0.10,
+            "AVGO": 0.10,
+            "TSM": 0.10,
+            "GOOGL": 0.10,
+            "AMZN": 0.09,
+            "XLV": 0.05,
+        },
+    },
+    "2023Q4": {
+        "name": "降息預期升溫",
+        "signal": "Fed暫停升息，市場開始定價2024降息",
+        "start": "2023-10-01",
+        "end": "2023-12-31",
+        "holdings": {
+            # signal_score: 0.7 (極度積極)
+            "NVDA": 0.25,
+            "MSFT": 0.18,
+            "AMD": 0.10,
+            "AVGO": 0.10,
+            "META": 0.10,
+            "GOOGL": 0.10,
+            "TSM": 0.10,
+            "AMZN": 0.07,
+        },
+    },
+    # ===== 2024 年 =====
+    "2024Q1": {
+        "name": "AI CapEx指引強勁",
+        "signal": "Hyperscaler 2024 CapEx指引大增，VIX低檔",
+        "start": "2024-01-01",
+        "end": "2024-03-31",
+        "holdings": {
+            # signal_score: 0.7
+            "NVDA": 0.30,
+            "MSFT": 0.18,
+            "TSM": 0.12,
+            "GOOGL": 0.12,
+            "AVGO": 0.12,
+            "AMD": 0.08,
+            "META": 0.08,
+        },
+    },
+    "2024Q2": {
+        "name": "HBM供需緊張",
+        "signal": "HBM供不應求新聞增加，記憶體股受關注",
+        "start": "2024-04-01",
+        "end": "2024-06-30",
+        "holdings": {
+            # signal_score: 0.6
+            "NVDA": 0.25,
+            "MU": 0.15,
+            "TSM": 0.15,
+            "MSFT": 0.12,
+            "AVGO": 0.12,
+            "AMD": 0.08,
+            "GOOGL": 0.08,
+            "XLV": 0.05,
+        },
+    },
+    "2024Q3": {
+        "name": "光互連題材",
+        "signal": "800G量產新聞增加，矽光子/CPO題材浮現",
+        "start": "2024-07-01",
+        "end": "2024-09-30",
+        "holdings": {
+            # signal_score: 0.6
+            "NVDA": 0.22,
+            "LITE": 0.12,
+            "COHR": 0.08,
+            "MU": 0.12,
+            "TSM": 0.12,
+            "VRT": 0.10,
+            "MSFT": 0.10,
+            "AVGO": 0.08,
+            "XLV": 0.06,
+        },
+    },
+    "2024Q4": {
+        "name": "電力瓶頸浮現",
+        "signal": "核電PPA新聞增加，資料中心電力題材",
+        "start": "2024-10-01",
+        "end": "2024-12-31",
+        "holdings": {
+            # signal_score: 0.5
+            "NVDA": 0.18,
+            "CEG": 0.12,
+            "VST": 0.08,
+            "LITE": 0.12,
+            "MU": 0.10,
+            "TSM": 0.12,
+            "VRT": 0.10,
+            "MSFT": 0.10,
+            "XLV": 0.08,
+        },
+    },
+    # ===== 2025 年 =====
+    "2025Q1": {
+        "name": "DeepSeek衝擊+關稅風險",
+        "signal": "VIX飆升至28，DeepSeek衝擊AI估值，關稅風險升級",
+        "start": "2025-01-01",
+        "end": "2025-03-31",
+        "holdings": {
+            # signal_score: -0.3 (熊市防禦)
+            "XLV": 0.25,    # 醫療防禦
+            "XLU": 0.20,    # 公用事業防禦
+            "CEG": 0.15,    # 電力 (AI需求不變)
+            "MSFT": 0.12,   # 軟體抗關稅
+            "GOOGL": 0.10,
+            "SHY": 0.10,    # 短債避險
+            "NVDA": 0.08,   # 大幅減碼
+        },
+    },
+    # ===== 2025 Q2-Q4 (未來預測，僅供參考) =====
+    "2025Q2": {
+        "name": "關稅談判觀望",
+        "signal": "[預測] 關稅影響待釐清，維持保守配置",
+        "start": "2025-04-01",
+        "end": "2025-06-30",
+        "holdings": {
+            # signal_score: -0.1 (中性偏保守)
+            "XLV": 0.15,    # 維持防禦
+            "CEG": 0.15,    # 電力需求穩定
+            "MSFT": 0.15,   # 軟體抗關稅
+            "LITE": 0.12,   # 矽光子
+            "NVDA": 0.12,   # 逐步加回
+            "GOOGL": 0.10,
+            "MU": 0.10,
+            "TSM": 0.06,
+            "XLU": 0.05,
+        },
+    },
+    "2025Q3": {
+        "name": "HBM4量產預期",
+        "signal": "[預測] 若HBM4如期量產，記憶體股可能領漲",
+        "start": "2025-07-01",
+        "end": "2025-09-30",
+        "holdings": {
+            "MU": 0.25,
+            "NVDA": 0.20,
+            "LITE": 0.15,
+            "MRVL": 0.10,
+            "TSM": 0.10,
+            "CEG": 0.10,
+            "VRT": 0.10,
+        },
+    },
+    "2025Q4": {
+        "name": "AI全面滲透預期",
+        "signal": "[預測] 若AI應用持續擴散，產業鏈全面受惠",
+        "start": "2025-10-01",
+        "end": "2025-12-31",
+        "holdings": {
+            "LITE": 0.15,
+            "MU": 0.15,
+            "NVDA": 0.15,
+            "CEG": 0.15,
+            "MRVL": 0.10,
+            "VRT": 0.10,
+            "TSM": 0.10,
+            "SMR": 0.10,
+        },
+    },
+    "2026Q1": {
+        "name": "次世代佈局預期",
+        "signal": "[預測] Rubin架構預熱，SMR核電佈局",
+        "start": "2026-01-01",
+        "end": "2026-03-31",
+        "holdings": {
+            "NVDA": 0.20,
+            "LITE": 0.15,
+            "MU": 0.15,
+            "CEG": 0.10,
+            "SMR": 0.10,
+            "MRVL": 0.10,
+            "TSM": 0.10,
+            "VRT": 0.10,
+        },
+    },
+}
+
+# 基準指數
+BENCHMARK_SYMBOLS = {
+    "SPY": "S&P 500",
+    "QQQ": "Nasdaq 100",
+    "SOXX": "半導體ETF",
+    "SMH": "VanEck半導體",
+}
+
+# ========== 規則化信號系統 ==========
+# 定義信號規則 - 每條規則基於月初可得資訊
+SIGNAL_RULES = {
+    # SPY 相對 200MA 位置 (最重要的趨勢指標)
+    "spy_below_200ma": {"weight": -0.30, "description": "SPY 低於 200MA"},
+    "spy_above_200ma": {"weight": +0.15, "description": "SPY 高於 200MA"},
+    "spy_far_below_200ma": {"weight": -0.20, "description": "SPY 低於 200MA 超過 5%"},
+
+    # VIX 恐慌指數
+    "vix_extreme": {"weight": -0.25, "description": "VIX > 35 (極度恐慌)"},
+    "vix_high": {"weight": -0.15, "description": "VIX 25-35 (恐慌)"},
+    "vix_elevated": {"weight": -0.05, "description": "VIX 20-25 (警戒)"},
+    "vix_low": {"weight": +0.10, "description": "VIX < 15 (平靜)"},
+
+    # SPY 動能 (近期表現)
+    "spy_momentum_negative": {"weight": -0.15, "description": "SPY 近月跌幅 > 5%"},
+    "spy_momentum_positive": {"weight": +0.10, "description": "SPY 近月漲幅 > 3%"},
+
+    # 200MA 斜率
+    "ma200_declining": {"weight": -0.10, "description": "200MA 下降趨勢"},
+    "ma200_rising": {"weight": +0.05, "description": "200MA 上升趨勢"},
+}
+
+
+@st.cache_data(ttl=86400)  # 快取一天
+def fetch_market_indicators(start_date: str, end_date: str) -> pd.DataFrame:
+    """取得市場指標數據 (SPY, VIX)"""
+    import yfinance as yf
+
+    # 取得 SPY 和 VIX
+    spy = yf.Ticker("SPY")
+    vix = yf.Ticker("^VIX")
+
+    spy_hist = spy.history(start=start_date, end=end_date)
+    vix_hist = vix.history(start=start_date, end=end_date)
+
+    if spy_hist.empty:
+        return pd.DataFrame()
+
+    # 合併數據
+    df = pd.DataFrame()
+    df["spy_close"] = spy_hist["Close"]
+    df["spy_ma200"] = spy_hist["Close"].rolling(window=200, min_periods=50).mean()
+    df["spy_ma50"] = spy_hist["Close"].rolling(window=50, min_periods=20).mean()
+    df["vix"] = vix_hist["Close"].reindex(df.index, method="ffill")
+
+    # 計算衍生指標
+    df["spy_vs_ma200_pct"] = (df["spy_close"] / df["spy_ma200"] - 1) * 100
+    df["spy_momentum_1m"] = df["spy_close"].pct_change(periods=21) * 100  # 約一個月
+    df["ma200_slope"] = df["spy_ma200"].pct_change(periods=21) * 100
+
+    return df
+
+
+def calculate_signal_score(row: pd.Series) -> tuple[float, list[str]]:
+    """根據規則計算單日信號分數"""
+    score = 0.0
+    triggered_rules = []
+
+    spy_vs_ma200 = row.get("spy_vs_ma200_pct", 0)
+    vix = row.get("vix", 20)
+    momentum = row.get("spy_momentum_1m", 0)
+    ma200_slope = row.get("ma200_slope", 0)
+
+    # SPY vs 200MA
+    if pd.notna(spy_vs_ma200):
+        if spy_vs_ma200 < -5:
+            score += SIGNAL_RULES["spy_far_below_200ma"]["weight"]
+            score += SIGNAL_RULES["spy_below_200ma"]["weight"]
+            triggered_rules.append("SPY遠低於200MA")
+        elif spy_vs_ma200 < 0:
+            score += SIGNAL_RULES["spy_below_200ma"]["weight"]
+            triggered_rules.append("SPY低於200MA")
+        else:
+            score += SIGNAL_RULES["spy_above_200ma"]["weight"]
+            triggered_rules.append("SPY高於200MA")
+
+    # VIX
+    if pd.notna(vix):
+        if vix > 35:
+            score += SIGNAL_RULES["vix_extreme"]["weight"]
+            triggered_rules.append(f"VIX極高({vix:.0f})")
+        elif vix > 25:
+            score += SIGNAL_RULES["vix_high"]["weight"]
+            triggered_rules.append(f"VIX偏高({vix:.0f})")
+        elif vix > 20:
+            score += SIGNAL_RULES["vix_elevated"]["weight"]
+            triggered_rules.append(f"VIX警戒({vix:.0f})")
+        elif vix < 15:
+            score += SIGNAL_RULES["vix_low"]["weight"]
+            triggered_rules.append(f"VIX低檔({vix:.0f})")
+
+    # Momentum
+    if pd.notna(momentum):
+        if momentum < -5:
+            score += SIGNAL_RULES["spy_momentum_negative"]["weight"]
+            triggered_rules.append(f"動能負({momentum:.1f}%)")
+        elif momentum > 3:
+            score += SIGNAL_RULES["spy_momentum_positive"]["weight"]
+            triggered_rules.append(f"動能正({momentum:.1f}%)")
+
+    # 200MA 斜率
+    if pd.notna(ma200_slope):
+        if ma200_slope < -0.5:
+            score += SIGNAL_RULES["ma200_declining"]["weight"]
+            triggered_rules.append("200MA下降")
+        elif ma200_slope > 0.5:
+            score += SIGNAL_RULES["ma200_rising"]["weight"]
+            triggered_rules.append("200MA上升")
+
+    # 限制在 -1 到 1 之間
+    score = max(-1.0, min(1.0, score))
+
+    return score, triggered_rules
+
+
+@st.cache_data(ttl=86400)
+def calculate_monthly_signals(start_year: int = 2022, end_year: int = 2026) -> dict:
+    """計算每月初的信號分數"""
+    # 取得足夠的歷史數據 (需要200天MA)
+    start_date = f"{start_year - 1}-01-01"
+    end_date = f"{end_year}-12-31"
+
+    df = fetch_market_indicators(start_date, end_date)
+
+    if df.empty:
+        return {}
+
+    monthly_signals = {}
+
+    # 對每個月，取月初第一個交易日的數據
+    for year in range(start_year, end_year + 1):
+        for month in range(1, 13):
+            month_key = f"{year}-{month:02d}"
+
+            # 找該月第一個交易日
+            month_start = f"{year}-{month:02d}-01"
+            if month == 12:
+                month_end = f"{year + 1}-01-01"
+            else:
+                month_end = f"{year}-{month + 1:02d}-01"
+
+            month_data = df[(df.index >= month_start) & (df.index < month_end)]
+
+            if month_data.empty:
+                continue
+
+            # 取月初第一個交易日
+            first_day = month_data.iloc[0]
+            score, rules = calculate_signal_score(first_day)
+
+            monthly_signals[month_key] = {
+                "date": month_data.index[0].strftime("%Y-%m-%d"),
+                "score": round(score, 2),
+                "rules": rules,
+                "spy_close": round(first_day.get("spy_close", 0), 2),
+                "spy_vs_ma200": round(first_day.get("spy_vs_ma200_pct", 0), 2),
+                "vix": round(first_day.get("vix", 0), 1),
+            }
+
+    return monthly_signals
+
+
+def get_rule_based_allocation(signal_score: float) -> dict:
+    """根據信號分數決定配置風格"""
+    if signal_score <= -0.4:
+        return {
+            "style": "極度防禦",
+            "equity_pct": 20,
+            "preferred": ["SHY", "XLV", "XLU", "COST", "JNJ", "PG"],
+        }
+    elif signal_score <= -0.2:
+        return {
+            "style": "防禦",
+            "equity_pct": 40,
+            "preferred": ["XLV", "XLU", "CEG", "COST", "MSFT", "SHY"],
+        }
+    elif signal_score <= 0.1:
+        return {
+            "style": "中性",
+            "equity_pct": 60,
+            "preferred": ["MSFT", "GOOGL", "XLV", "CEG", "NVDA", "AAPL"],
+        }
+    elif signal_score <= 0.3:
+        return {
+            "style": "偏多",
+            "equity_pct": 75,
+            "preferred": ["NVDA", "MSFT", "GOOGL", "META", "TSM", "AMD"],
+        }
+    else:
+        return {
+            "style": "積極",
+            "equity_pct": 90,
+            "preferred": ["NVDA", "LITE", "MRVL", "TSM", "AMD", "MU"],
+        }
+
+
+# ========== 月度持股池 (2022-2026) ==========
+# 基於每月初可得信號的配置 (holdings 仍手動維護，signal_score 可由規則系統覆蓋)
+MONTHLY_PORTFOLIOS = {
+    # ===== 2022 年 =====
+    "2022-01": {
+        "signal": "Fed轉鷹，CPI 7%，SPY仍在高檔",
+        "signal_score": 0.2,
+        "holdings": {"MSFT": 0.18, "AAPL": 0.15, "GOOGL": 0.12, "NVDA": 0.10, "XLV": 0.12, "XLF": 0.10, "JPM": 0.08, "XLE": 0.08, "COST": 0.07},
+    },
+    "2022-02": {
+        "signal": "俄烏戰爭爆發，VIX飆升，油價大漲",
+        "signal_score": -0.3,
+        "holdings": {"XLE": 0.20, "XLV": 0.18, "XLU": 0.15, "COST": 0.12, "JNJ": 0.10, "PG": 0.10, "SHY": 0.08, "JPM": 0.07},
+    },
+    "2022-03": {
+        "signal": "Fed首次升息25bp，通膨持續上升",
+        "signal_score": -0.2,
+        "holdings": {"XLE": 0.20, "XLV": 0.15, "XLU": 0.12, "XLF": 0.12, "COST": 0.10, "JNJ": 0.10, "PG": 0.08, "JPM": 0.08, "SHY": 0.05},
+    },
+    "2022-04": {
+        "signal": "CPI 8.5%創新高，Fed暗示50bp",
+        "signal_score": -0.4,
+        "holdings": {"XLE": 0.22, "XLV": 0.18, "XLU": 0.15, "SHY": 0.12, "COST": 0.10, "JNJ": 0.10, "PG": 0.08, "UNH": 0.05},
+    },
+    "2022-05": {
+        "signal": "Fed升息50bp，QT開始，SPY跌破200MA",
+        "signal_score": -0.5,
+        "holdings": {"XLE": 0.20, "XLV": 0.18, "SHY": 0.18, "XLU": 0.15, "COST": 0.10, "JNJ": 0.10, "PG": 0.09},
+    },
+    "2022-06": {
+        "signal": "CPI 9.1%峰值！Fed升息75bp",
+        "signal_score": -0.6,
+        "holdings": {"SHY": 0.25, "XLE": 0.18, "XLV": 0.18, "XLU": 0.15, "COST": 0.10, "JNJ": 0.08, "PG": 0.06},
+    },
+    "2022-07": {
+        "signal": "技術性反彈，CPI仍高",
+        "signal_score": -0.3,
+        "holdings": {"XLE": 0.18, "XLV": 0.18, "SHY": 0.15, "XLU": 0.12, "COST": 0.10, "MSFT": 0.08, "AAPL": 0.08, "JNJ": 0.06, "PG": 0.05},
+    },
+    "2022-08": {
+        "signal": "Jackson Hole鷹派發言，反彈結束",
+        "signal_score": -0.5,
+        "holdings": {"SHY": 0.22, "XLV": 0.18, "XLE": 0.15, "XLU": 0.15, "COST": 0.10, "JNJ": 0.10, "PG": 0.10},
+    },
+    "2022-09": {
+        "signal": "Fed升息75bp，暗示更高利率",
+        "signal_score": -0.6,
+        "holdings": {"SHY": 0.28, "XLV": 0.18, "XLU": 0.18, "XLE": 0.12, "COST": 0.10, "JNJ": 0.08, "PG": 0.06},
+    },
+    "2022-10": {
+        "signal": "SPY接近年度低點，VIX高檔",
+        "signal_score": -0.4,
+        "holdings": {"SHY": 0.22, "XLV": 0.18, "XLU": 0.15, "XLE": 0.12, "COST": 0.10, "MSFT": 0.08, "AAPL": 0.08, "JNJ": 0.07},
+    },
+    "2022-11": {
+        "signal": "CPI首次放緩至7.7%，市場反彈",
+        "signal_score": -0.1,
+        "holdings": {"XLV": 0.15, "MSFT": 0.12, "AAPL": 0.12, "XLE": 0.12, "XLU": 0.10, "COST": 0.10, "GOOGL": 0.08, "SHY": 0.08, "JPM": 0.08, "JNJ": 0.05},
+    },
+    "2022-12": {
+        "signal": "Fed升息50bp放緩，年底盤整",
+        "signal_score": 0.0,
+        "holdings": {"XLV": 0.15, "MSFT": 0.12, "AAPL": 0.12, "XLE": 0.10, "XLU": 0.10, "COST": 0.10, "GOOGL": 0.08, "JPM": 0.08, "META": 0.08, "JNJ": 0.07},
+    },
+    # ===== 2023 年 =====
+    "2023-01": {
+        "signal": "新年樂觀情緒，CPI持續下降",
+        "signal_score": 0.2,
+        "holdings": {"MSFT": 0.15, "AAPL": 0.12, "GOOGL": 0.12, "META": 0.10, "XLV": 0.12, "NVDA": 0.08, "XLE": 0.08, "JPM": 0.08, "COST": 0.08, "AMD": 0.07},
+    },
+    "2023-02": {
+        "signal": "就業數據強勁，升息擔憂回升",
+        "signal_score": 0.0,
+        "holdings": {"MSFT": 0.14, "AAPL": 0.12, "GOOGL": 0.10, "XLV": 0.12, "META": 0.10, "XLE": 0.10, "JPM": 0.08, "COST": 0.08, "NVDA": 0.08, "XLU": 0.08},
+    },
+    "2023-03": {
+        "signal": "SVB倒閉！銀行危機爆發",
+        "signal_score": -0.4,
+        "holdings": {"SHY": 0.20, "XLV": 0.18, "XLU": 0.15, "MSFT": 0.12, "AAPL": 0.10, "GOOGL": 0.08, "COST": 0.08, "JNJ": 0.05, "PG": 0.04},
+    },
+    "2023-04": {
+        "signal": "銀行危機緩和，Fed暫停預期",
+        "signal_score": 0.1,
+        "holdings": {"MSFT": 0.15, "AAPL": 0.12, "GOOGL": 0.12, "XLV": 0.12, "META": 0.10, "NVDA": 0.10, "COST": 0.08, "XLU": 0.08, "AMD": 0.08, "SHY": 0.05},
+    },
+    "2023-05": {
+        "signal": "AI熱潮初現！NVDA財報驚艷",
+        "signal_score": 0.5,
+        "holdings": {"NVDA": 0.22, "MSFT": 0.15, "GOOGL": 0.12, "META": 0.12, "AAPL": 0.10, "AMD": 0.10, "TSM": 0.08, "AVGO": 0.06, "XLV": 0.05},
+    },
+    "2023-06": {
+        "signal": "AI題材持續發酵，Fed跳過升息",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.25, "MSFT": 0.15, "GOOGL": 0.12, "META": 0.10, "AMD": 0.10, "TSM": 0.08, "AVGO": 0.08, "AAPL": 0.07, "MU": 0.05},
+    },
+    "2023-07": {
+        "signal": "科技股續強，CPI降至3%",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.25, "MSFT": 0.15, "GOOGL": 0.12, "META": 0.10, "AMD": 0.10, "TSM": 0.08, "AVGO": 0.08, "MU": 0.07, "AAPL": 0.05},
+    },
+    "2023-08": {
+        "signal": "中國經濟擔憂，美債殖利率飆升",
+        "signal_score": 0.2,
+        "holdings": {"NVDA": 0.18, "MSFT": 0.15, "XLV": 0.12, "GOOGL": 0.10, "META": 0.10, "AAPL": 0.08, "AMD": 0.08, "TSM": 0.07, "XLU": 0.07, "AVGO": 0.05},
+    },
+    "2023-09": {
+        "signal": "Higher for longer，10Y破4.5%",
+        "signal_score": -0.1,
+        "holdings": {"XLV": 0.15, "NVDA": 0.15, "MSFT": 0.12, "XLU": 0.10, "GOOGL": 0.10, "META": 0.08, "AAPL": 0.08, "COST": 0.08, "SHY": 0.07, "AMD": 0.07},
+    },
+    "2023-10": {
+        "signal": "以巴衝突，10Y觸4.9%高點",
+        "signal_score": -0.2,
+        "holdings": {"XLV": 0.18, "XLU": 0.12, "MSFT": 0.12, "NVDA": 0.12, "SHY": 0.10, "GOOGL": 0.10, "COST": 0.08, "META": 0.08, "AAPL": 0.05, "JNJ": 0.05},
+    },
+    "2023-11": {
+        "signal": "Fed暗示停止升息，殖利率回落",
+        "signal_score": 0.4,
+        "holdings": {"NVDA": 0.20, "MSFT": 0.15, "GOOGL": 0.12, "META": 0.12, "AMD": 0.10, "TSM": 0.08, "AVGO": 0.08, "AAPL": 0.08, "MU": 0.07},
+    },
+    "2023-12": {
+        "signal": "Fed暗示2024降息，聖誕行情",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.22, "MSFT": 0.15, "META": 0.12, "GOOGL": 0.12, "AMD": 0.10, "TSM": 0.08, "AVGO": 0.08, "MU": 0.08, "AAPL": 0.05},
+    },
+    # ===== 2024 年 =====
+    "2024-01": {
+        "signal": "AI CapEx指引強勁，VIX低檔",
+        "signal_score": 0.7,
+        "holdings": {"NVDA": 0.30, "MSFT": 0.18, "TSM": 0.12, "AVGO": 0.12, "AMD": 0.10, "GOOGL": 0.10, "META": 0.08},
+    },
+    "2024-02": {
+        "signal": "NVDA財報超預期，AI需求確認",
+        "signal_score": 0.7,
+        "holdings": {"NVDA": 0.32, "MSFT": 0.16, "TSM": 0.12, "AVGO": 0.12, "AMD": 0.10, "GOOGL": 0.10, "META": 0.08},
+    },
+    "2024-03": {
+        "signal": "GTC大會，Blackwell發布",
+        "signal_score": 0.7,
+        "holdings": {"NVDA": 0.30, "MSFT": 0.15, "TSM": 0.12, "AVGO": 0.12, "MU": 0.10, "AMD": 0.08, "GOOGL": 0.08, "META": 0.05},
+    },
+    "2024-04": {
+        "signal": "HBM供需緊張浮現",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.28, "MU": 0.15, "TSM": 0.12, "MSFT": 0.12, "AVGO": 0.10, "AMD": 0.08, "GOOGL": 0.08, "XLV": 0.07},
+    },
+    "2024-05": {
+        "signal": "記憶體題材持續",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.25, "MU": 0.18, "TSM": 0.12, "MSFT": 0.12, "AVGO": 0.10, "AMD": 0.08, "GOOGL": 0.08, "XLV": 0.07},
+    },
+    "2024-06": {
+        "signal": "NVDA成全球市值最大",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.25, "MU": 0.15, "TSM": 0.12, "MSFT": 0.12, "AVGO": 0.10, "LITE": 0.08, "AMD": 0.08, "GOOGL": 0.05, "XLV": 0.05},
+    },
+    "2024-07": {
+        "signal": "800G量產，光互連題材",
+        "signal_score": 0.6,
+        "holdings": {"NVDA": 0.22, "LITE": 0.12, "MU": 0.12, "TSM": 0.12, "MSFT": 0.10, "COHR": 0.08, "VRT": 0.08, "AVGO": 0.08, "XLV": 0.08},
+    },
+    "2024-08": {
+        "signal": "矽光子題材擴散",
+        "signal_score": 0.5,
+        "holdings": {"NVDA": 0.20, "LITE": 0.15, "MU": 0.12, "TSM": 0.10, "VRT": 0.10, "COHR": 0.08, "MSFT": 0.08, "AVGO": 0.07, "XLV": 0.10},
+    },
+    "2024-09": {
+        "signal": "Fed降息預期，光互連持續",
+        "signal_score": 0.5,
+        "holdings": {"NVDA": 0.18, "LITE": 0.15, "CEG": 0.10, "MU": 0.10, "TSM": 0.10, "VRT": 0.10, "MSFT": 0.10, "COHR": 0.07, "XLV": 0.10},
+    },
+    "2024-10": {
+        "signal": "核電PPA簽約消息，電力題材",
+        "signal_score": 0.5,
+        "holdings": {"CEG": 0.15, "NVDA": 0.15, "LITE": 0.12, "VST": 0.08, "MU": 0.10, "TSM": 0.10, "VRT": 0.10, "MSFT": 0.10, "XLV": 0.10},
+    },
+    "2024-11": {
+        "signal": "川普當選，關稅擔憂初現",
+        "signal_score": 0.3,
+        "holdings": {"CEG": 0.15, "NVDA": 0.12, "LITE": 0.12, "XLV": 0.15, "MSFT": 0.12, "MU": 0.08, "VRT": 0.08, "TSM": 0.08, "GOOGL": 0.10},
+    },
+    "2024-12": {
+        "signal": "年底獲利了結，估值擔憂",
+        "signal_score": 0.2,
+        "holdings": {"XLV": 0.15, "CEG": 0.15, "MSFT": 0.12, "NVDA": 0.12, "LITE": 0.10, "GOOGL": 0.10, "XLU": 0.08, "VRT": 0.08, "MU": 0.05, "SHY": 0.05},
+    },
+    # ===== 2025 年 =====
+    "2025-01": {
+        "signal": "DeepSeek衝擊！VIX飆升至28",
+        "signal_score": -0.4,
+        "holdings": {"XLV": 0.25, "XLU": 0.20, "SHY": 0.15, "CEG": 0.12, "MSFT": 0.10, "GOOGL": 0.08, "NVDA": 0.05, "LITE": 0.05},
+    },
+    "2025-02": {
+        "signal": "關稅威脅升級，市場震盪",
+        "signal_score": -0.3,
+        "holdings": {"XLV": 0.22, "XLU": 0.18, "CEG": 0.15, "SHY": 0.12, "MSFT": 0.12, "GOOGL": 0.08, "NVDA": 0.08, "LITE": 0.05},
+    },
+    "2025-03": {
+        "signal": "關稅談判中，維持觀望",
+        "signal_score": -0.2,
+        "holdings": {"XLV": 0.18, "CEG": 0.15, "XLU": 0.15, "MSFT": 0.12, "NVDA": 0.10, "GOOGL": 0.10, "LITE": 0.08, "SHY": 0.07, "VRT": 0.05},
+    },
+    # ===== 2025 Q2 (關稅風暴) =====
+    "2025-04": {
+        "signal": "4/2解放日關稅！SPY暴跌，VIX飆至45",
+        "signal_score": -0.6,
+        "holdings": {"SHY": 0.30, "XLV": 0.20, "XLU": 0.18, "COST": 0.10, "JNJ": 0.08, "PG": 0.07, "CEG": 0.07},
+    },
+    "2025-05": {
+        "signal": "關稅談判反覆，市場劇烈震盪",
+        "signal_score": -0.4,
+        "holdings": {"SHY": 0.22, "XLV": 0.20, "XLU": 0.15, "CEG": 0.12, "COST": 0.10, "MSFT": 0.08, "JNJ": 0.08, "PG": 0.05},
+    },
+    "2025-06": {
+        "signal": "部分關稅暫緩90天，市場喘息",
+        "signal_score": -0.2,
+        "holdings": {"XLV": 0.18, "CEG": 0.15, "XLU": 0.12, "SHY": 0.12, "MSFT": 0.12, "NVDA": 0.08, "GOOGL": 0.08, "LITE": 0.08, "COST": 0.07},
+    },
+    # ===== 2025 Q3 (謹慎復甦) =====
+    "2025-07": {
+        "signal": "關稅不確定性持續，觀望Q2財報",
+        "signal_score": -0.1,
+        "holdings": {"XLV": 0.15, "CEG": 0.15, "MSFT": 0.12, "NVDA": 0.10, "XLU": 0.10, "GOOGL": 0.10, "LITE": 0.08, "SHY": 0.08, "MU": 0.07, "VRT": 0.05},
+    },
+    "2025-08": {
+        "signal": "AI CapEx確認持續，科技股回穩",
+        "signal_score": 0.1,
+        "holdings": {"NVDA": 0.15, "MSFT": 0.12, "CEG": 0.12, "LITE": 0.12, "XLV": 0.10, "GOOGL": 0.10, "MU": 0.08, "MRVL": 0.08, "TSM": 0.08, "VRT": 0.05},
+    },
+    "2025-09": {
+        "signal": "Fed維持利率，關稅談判有進展",
+        "signal_score": 0.2,
+        "holdings": {"NVDA": 0.15, "LITE": 0.15, "MSFT": 0.12, "CEG": 0.10, "MRVL": 0.10, "MU": 0.10, "GOOGL": 0.08, "TSM": 0.08, "XLV": 0.07, "VRT": 0.05},
+    },
+    # ===== 2025 Q4 (逐步回穩) =====
+    "2025-10": {
+        "signal": "Q3財報優於預期，CPO題材發酵",
+        "signal_score": 0.3,
+        "holdings": {"LITE": 0.18, "NVDA": 0.15, "MRVL": 0.12, "CEG": 0.10, "MSFT": 0.10, "MU": 0.10, "COHR": 0.08, "TSM": 0.07, "GOOGL": 0.05, "VRT": 0.05},
+    },
+    "2025-11": {
+        "signal": "市場回穩，年底行情啟動",
+        "signal_score": 0.4,
+        "holdings": {"LITE": 0.18, "NVDA": 0.15, "MRVL": 0.12, "MU": 0.10, "CEG": 0.10, "MSFT": 0.10, "COHR": 0.08, "TSM": 0.07, "GOOGL": 0.05, "META": 0.05},
+    },
+    "2025-12": {
+        "signal": "聖誕行情，但關稅仍是變數",
+        "signal_score": 0.3,
+        "holdings": {"NVDA": 0.15, "LITE": 0.15, "MRVL": 0.10, "MSFT": 0.10, "CEG": 0.10, "MU": 0.10, "XLV": 0.08, "TSM": 0.08, "COHR": 0.07, "GOOGL": 0.07},
+    },
+    # ===== 2026 年 =====
+    "2026-01": {
+        "signal": "新年展望，關稅政策待觀察",
+        "signal_score": 0.2,
+        "holdings": {"NVDA": 0.15, "LITE": 0.12, "MSFT": 0.12, "CEG": 0.10, "XLV": 0.12, "MU": 0.10, "MRVL": 0.08, "TSM": 0.08, "GOOGL": 0.08, "XLU": 0.05},
+    },
+    "2026-02": {
+        "signal": "SPY穩站200MA上方，VIX低檔，偏多操作",
+        "signal_score": 0.2,
+        "holdings": {"NVDA": 0.18, "LITE": 0.15, "MRVL": 0.12, "MU": 0.10, "CEG": 0.10, "MSFT": 0.10, "TSM": 0.08, "COHR": 0.07, "GOOGL": 0.05, "XLV": 0.05},
+    },
+}
+
+def get_monthly_periods(start_month: str, end_month: str) -> list:
+    """取得月份列表"""
+    months = list(MONTHLY_PORTFOLIOS.keys())
+    try:
+        start_idx = months.index(start_month)
+        end_idx = months.index(end_month)
+        return months[start_idx:end_idx+1]
+    except ValueError:
+        return []
+
+
+@st.cache_data(ttl=3600)
+def fetch_stock_prices(symbols: list, start_date: str, end_date: str) -> pd.DataFrame:
+    """取得股票歷史價格"""
+    import yfinance as yf
+
+    all_data = {}
+    for symbol in symbols:
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start_date, end=end_date)
+            if not df.empty:
+                all_data[symbol] = df['Close']
+        except Exception as e:
+            st.warning(f"無法取得 {symbol} 數據: {e}")
+
+    if all_data:
+        return pd.DataFrame(all_data)
+    return pd.DataFrame()
+
+
+def calculate_portfolio_returns(prices_df: pd.DataFrame, weights: dict) -> pd.Series:
+    """計算投資組合報酬"""
+    # 只使用有數據的股票
+    available = [s for s in weights.keys() if s in prices_df.columns]
+    if not available:
+        return pd.Series()
+
+    # 重新正規化權重
+    total_weight = sum(weights[s] for s in available)
+    norm_weights = {s: weights[s] / total_weight for s in available}
+
+    # 計算日報酬
+    returns = prices_df[available].pct_change()
+
+    # 加權報酬
+    portfolio_returns = pd.Series(0, index=returns.index)
+    for symbol, weight in norm_weights.items():
+        portfolio_returns += returns[symbol] * weight
+
+    return portfolio_returns
+
+
+def calculate_metrics(returns: pd.Series) -> dict:
+    """計算績效指標"""
+    if returns.empty or len(returns) < 2:
+        return {"total_return": 0, "annualized_return": 0, "volatility": 0,
+                "sharpe": 0, "max_drawdown": 0, "win_rate": 0}
+
+    returns = returns.dropna()
+    if len(returns) < 2:
+        return {"total_return": 0, "annualized_return": 0, "volatility": 0,
+                "sharpe": 0, "max_drawdown": 0, "win_rate": 0}
+
+    # 總報酬
+    cumulative = (1 + returns).cumprod()
+    total_return = (cumulative.iloc[-1] - 1) * 100
+
+    # 年化報酬 (假設252交易日)
+    days = len(returns)
+    annualized_return = ((1 + total_return/100) ** (252/days) - 1) * 100 if days > 0 else 0
+
+    # 波動率 (年化)
+    volatility = returns.std() * (252 ** 0.5) * 100
+
+    # 夏普比率 (假設無風險利率 4%)
+    risk_free = 0.04 / 252
+    excess_returns = returns - risk_free
+    sharpe = (excess_returns.mean() / returns.std()) * (252 ** 0.5) if returns.std() > 0 else 0
+
+    # 最大回撤
+    cummax = cumulative.cummax()
+    drawdown = (cumulative - cummax) / cummax
+    max_drawdown = drawdown.min() * 100
+
+    # 勝率
+    win_rate = (returns > 0).sum() / len(returns) * 100
+
+    return {
+        "total_return": total_return,
+        "annualized_return": annualized_return,
+        "volatility": volatility,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown,
+        "win_rate": win_rate,
+    }
+
+
+def render_quarterly_backtest_page():
+    """渲染持股池回測頁面"""
+    st.title("📊 持股池回測系統")
+    st.markdown("**基於趨勢雷達分析的投資組合回測**")
+
+    # 換股頻率選擇
+    freq_tab1, freq_tab2, freq_tab3 = st.tabs(["📅 季度換股", "📆 月度換股", "📐 規則信號"])
+
+    with freq_tab1:
+        render_quarterly_backtest()
+
+    with freq_tab2:
+        render_monthly_backtest()
+
+    with freq_tab3:
+        render_rule_based_signals()
+
+
+def render_quarterly_backtest():
+    """季度回測"""
+    st.markdown("#### 季度換股回測 (2022-2026)")
+
+    # 選擇回測範圍
+    col1, col2 = st.columns(2)
+    with col1:
+        quarters = list(QUARTERLY_PORTFOLIOS.keys())
+        start_q = st.selectbox("起始季度", quarters, index=0, key="q_start")
+    with col2:
+        start_idx = quarters.index(start_q)
+        end_q = st.selectbox("結束季度", quarters[start_idx:], index=len(quarters[start_idx:])-1, key="q_end")
+
+    # 選擇基準
+    benchmark = st.selectbox(
+        "比較基準",
+        list(BENCHMARK_SYMBOLS.keys()),
+        format_func=lambda x: f"{x} - {BENCHMARK_SYMBOLS[x]}",
+        key="q_bench"
+    )
+
+    # 策略選擇
+    st.markdown("---")
+    st.markdown("#### 🎯 熊市策略選擇")
+
+    strategy = st.radio(
+        "當信號分數 ≤ -0.2 (熊市信號) 時：",
+        ["🛡️ 熊市防禦", "💵 熊市空手", "📊 兩者比較"],
+        index=2,
+        horizontal=True,
+        help="熊市防禦：持有防禦股(XLV/XLU/SHY)；熊市空手：100%現金(SHY)",
+        key="q_strategy"
+    )
+
+    # 空手閾值
+    if strategy in ["💵 熊市空手", "📊 兩者比較"]:
+        cash_threshold = st.slider(
+            "空手信號閾值",
+            min_value=-0.5,
+            max_value=0.0,
+            value=-0.2,
+            step=0.1,
+            help="信號分數低於此值時，轉為100%現金",
+            key="q_threshold"
+        )
+    else:
+        cash_threshold = -0.2
+
+    if st.button("🚀 開始季度回測", type="primary", use_container_width=True, key="q_run"):
+        with st.spinner("正在取得數據並計算..."):
+            run_backtest(start_q, end_q, benchmark, strategy, cash_threshold)
+
+
+def render_monthly_backtest():
+    """月度回測"""
+    st.markdown("#### 月度換股回測 (2022-2026)")
+    st.info("💡 月度換股更靈活，適合主動管理。每月初根據信號調整持股。")
+
+    # 信號來源選擇
+    signal_source = st.radio(
+        "📡 信號來源",
+        ["📝 手動信號 (人工判斷)", "📐 規則信號 (自動計算)"],
+        index=0,
+        horizontal=True,
+        help="手動信號：使用預設的 signal_score；規則信號：根據 SPY/VIX 等指標自動計算",
+        key="m_signal_source"
+    )
+    use_rule_signals = signal_source == "📐 規則信號 (自動計算)"
+
+    # 選擇回測範圍
+    col1, col2 = st.columns(2)
+    months = list(MONTHLY_PORTFOLIOS.keys())
+    with col1:
+        start_m = st.selectbox("起始月份", months, index=0, key="m_start")
+    with col2:
+        start_idx = months.index(start_m)
+        end_m = st.selectbox("結束月份", months[start_idx:], index=len(months[start_idx:])-1, key="m_end")
+
+    # 選擇基準
+    benchmark = st.selectbox(
+        "比較基準",
+        list(BENCHMARK_SYMBOLS.keys()),
+        format_func=lambda x: f"{x} - {BENCHMARK_SYMBOLS[x]}",
+        key="m_bench"
+    )
+
+    # 熊市策略
+    st.markdown("---")
+    strategy = st.radio(
+        "當信號分數 ≤ -0.2 (熊市信號) 時：",
+        ["🛡️ 熊市防禦", "💵 熊市空手", "📊 兩者比較"],
+        index=2,
+        horizontal=True,
+        help="熊市防禦：按配置持有防禦股；熊市空手：100%現金(SHY)",
+        key="m_strategy"
+    )
+
+    # 空手閾值
+    if strategy in ["💵 熊市空手", "📊 兩者比較"]:
+        cash_threshold = st.slider(
+            "空手信號閾值",
+            min_value=-0.5,
+            max_value=0.0,
+            value=-0.2,
+            step=0.1,
+            help="信號分數低於此值時，轉為100%現金",
+            key="m_threshold"
+        )
+    else:
+        cash_threshold = -0.2
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🚀 開始月度回測", type="primary", use_container_width=True, key="m_run"):
+            with st.spinner("正在取得數據並計算..."):
+                run_monthly_backtest(start_m, end_m, benchmark, strategy, cash_threshold, use_rule_signals)
+
+    with col2:
+        if st.button("📋 查看本月建議", use_container_width=True, key="m_suggest"):
+            show_current_month_suggestion()
+
+
+def show_current_month_suggestion():
+    """顯示當月換股建議"""
+    from datetime import datetime
+    current_month = datetime.now().strftime("%Y-%m")
+
+    st.markdown("---")
+    st.markdown("### 📋 當月持股建議")
+
+    if current_month in MONTHLY_PORTFOLIOS:
+        m_info = MONTHLY_PORTFOLIOS[current_month]
+        signal_score = m_info["signal_score"]
+
+        # 信號燈號
+        if signal_score >= 0.5:
+            light = "🟢 積極"
+        elif signal_score >= 0.2:
+            light = "🟡 偏多"
+        elif signal_score >= -0.2:
+            light = "⚪ 中性"
+        elif signal_score >= -0.4:
+            light = "🟠 偏空"
+        else:
+            light = "🔴 防禦"
+
+        st.markdown(f"**月份**: {current_month}")
+        st.markdown(f"**信號**: {m_info['signal']}")
+        st.markdown(f"**信號分數**: {signal_score:+.1f} ({light})")
+
+        st.markdown("**建議持股配置:**")
+        holdings_df = pd.DataFrame([
+            {
+                "股票": s,
+                "權重": f"{w*100:.0f}%",
+                "公司": STOCK_DETAILS.get(s, {}).get("name", s)
+            }
+            for s, w in sorted(m_info["holdings"].items(), key=lambda x: x[1], reverse=True)
+        ])
+        st.dataframe(holdings_df, use_container_width=True, hide_index=True)
+
+        # 下月預覽
+        next_month_candidates = [m for m in MONTHLY_PORTFOLIOS.keys() if m > current_month]
+        if next_month_candidates:
+            next_month = next_month_candidates[0]
+            next_info = MONTHLY_PORTFOLIOS[next_month]
+            with st.expander(f"📅 下月預覽 ({next_month})"):
+                st.markdown(f"**信號**: {next_info['signal']}")
+                st.markdown(f"**信號分數**: {next_info['signal_score']:+.1f}")
+    else:
+        # 找最近的月份
+        past_months = [m for m in MONTHLY_PORTFOLIOS.keys() if m <= current_month]
+        if past_months:
+            latest = past_months[-1]
+            m_info = MONTHLY_PORTFOLIOS[latest]
+            st.warning(f"當月 ({current_month}) 尚無配置，顯示最近配置 ({latest})")
+            st.markdown(f"**信號**: {m_info['signal']}")
+
+            holdings_df = pd.DataFrame([
+                {"股票": s, "權重": f"{w*100:.0f}%", "公司": STOCK_DETAILS.get(s, {}).get("name", s)}
+                for s, w in sorted(m_info["holdings"].items(), key=lambda x: x[1], reverse=True)
+            ])
+            st.dataframe(holdings_df, use_container_width=True, hide_index=True)
+        else:
+            st.error("無可用配置")
+
+
+def render_rule_based_signals():
+    """顯示規則化信號系統"""
+    st.markdown("#### 📐 規則化信號系統")
+    st.info("""
+    **無後見之明的信號系統** - 所有信號基於月初第一個交易日可得的市場數據自動計算，
+    不依賴人工判斷，避免事後諸葛的偏誤。
+    """)
+
+    # 顯示規則定義
+    with st.expander("📋 信號規則定義", expanded=False):
+        rules_data = []
+        for rule_id, rule in SIGNAL_RULES.items():
+            rules_data.append({
+                "規則": rule["description"],
+                "權重": f"{rule['weight']:+.2f}",
+                "類型": "空方" if rule["weight"] < 0 else "多方"
+            })
+        st.dataframe(pd.DataFrame(rules_data), use_container_width=True, hide_index=True)
+
+        st.markdown("""
+        **計算邏輯：**
+        - 每月初第一個交易日，檢查各項指標
+        - 觸發的規則權重加總 = 信號分數
+        - 分數範圍：-1.0 (極度看空) 到 +1.0 (極度看多)
+        - 分數 ≤ -0.2 視為熊市信號
+        """)
+
+    # 計算信號
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_year = st.selectbox("起始年份", [2022, 2023, 2024, 2025, 2026], index=0, key="rule_start_year")
+    with col2:
+        end_year = st.selectbox("結束年份", [2022, 2023, 2024, 2025, 2026], index=4, key="rule_end_year")
+
+    if st.button("🔄 計算規則信號", type="primary", use_container_width=True, key="calc_rules"):
+        with st.spinner("正在取得市場數據並計算信號..."):
+            signals = calculate_monthly_signals(start_year, end_year)
+
+            if not signals:
+                st.error("無法取得市場數據")
+                return
+
+            # 顯示信號結果
+            st.markdown("### 📊 計算結果")
+
+            # 與手動信號比較
+            st.markdown("#### 規則信號 vs 手動信號")
+
+            compare_data = []
+            for month_key in sorted(signals.keys()):
+                sig = signals[month_key]
+                manual_score = MONTHLY_PORTFOLIOS.get(month_key, {}).get("signal_score", None)
+                manual_signal = MONTHLY_PORTFOLIOS.get(month_key, {}).get("signal", "N/A")
+
+                rule_score = sig["score"]
+
+                # 判斷是否一致
+                rule_bear = rule_score <= -0.2
+                manual_bear = manual_score <= -0.2 if manual_score is not None else None
+
+                if manual_bear is None:
+                    match = "⚪"
+                elif rule_bear == manual_bear:
+                    match = "✅"
+                else:
+                    match = "❌"
+
+                compare_data.append({
+                    "月份": month_key,
+                    "規則分數": f"{rule_score:+.2f}",
+                    "手動分數": f"{manual_score:+.2f}" if manual_score is not None else "N/A",
+                    "一致": match,
+                    "觸發規則": ", ".join(sig["rules"][:3]),
+                    "SPY": f"${sig['spy_close']:.0f}",
+                    "vs200MA": f"{sig['spy_vs_ma200']:+.1f}%",
+                    "VIX": f"{sig['vix']:.0f}",
+                })
+
+            df = pd.DataFrame(compare_data)
+            st.dataframe(df, use_container_width=True, hide_index=True, height=400)
+
+            # 統計一致性
+            matches = [d["一致"] for d in compare_data if d["一致"] != "⚪"]
+            if matches:
+                match_rate = sum(1 for m in matches if m == "✅") / len(matches) * 100
+                st.metric("熊市/多頭判斷一致率", f"{match_rate:.0f}%")
+
+            # 繪製信號走勢圖
+            st.markdown("#### 📈 信號分數走勢")
+            fig = go.Figure()
+
+            months = sorted(signals.keys())
+            rule_scores = [signals[m]["score"] for m in months]
+
+            fig.add_trace(go.Scatter(
+                x=months, y=rule_scores,
+                name="規則信號", mode="lines+markers",
+                line=dict(color="#2196F3", width=2)
+            ))
+
+            # 手動信號
+            manual_scores = [MONTHLY_PORTFOLIOS.get(m, {}).get("signal_score", None) for m in months]
+            manual_scores_clean = [s if s is not None else 0 for s in manual_scores]
+            fig.add_trace(go.Scatter(
+                x=months, y=manual_scores_clean,
+                name="手動信號", mode="lines+markers",
+                line=dict(color="#FF9800", width=2, dash="dot")
+            ))
+
+            # 熊市閾值線
+            fig.add_hline(y=-0.2, line_dash="dash", line_color="red", annotation_text="熊市閾值")
+            fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.3)
+
+            fig.update_layout(
+                xaxis_title="月份",
+                yaxis_title="信號分數",
+                hovermode="x unified",
+                height=400,
+                yaxis=dict(range=[-1, 1])
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # 顯示不一致的月份
+            disagreements = [d for d in compare_data if d["一致"] == "❌"]
+            if disagreements:
+                st.markdown("#### ⚠️ 判斷不一致的月份")
+                st.dataframe(pd.DataFrame(disagreements), use_container_width=True, hide_index=True)
+
+
+def run_monthly_backtest(start_m: str, end_m: str, benchmark: str, strategy: str, cash_threshold: float, use_rule_signals: bool = False):
+    """執行月度回測"""
+    selected_months = get_monthly_periods(start_m, end_m)
+
+    if not selected_months:
+        st.error("無效的月份範圍")
+        return
+
+    # 如果使用規則信號，先計算
+    rule_signals = {}
+    if use_rule_signals:
+        with st.spinner("計算規則信號中..."):
+            start_year = int(start_m.split("-")[0])
+            end_year = int(end_m.split("-")[0])
+            rule_signals = calculate_monthly_signals(start_year, end_year)
+            if not rule_signals:
+                st.error("無法計算規則信號，改用手動信號")
+                use_rule_signals = False
+            else:
+                st.success(f"✅ 已計算 {len(rule_signals)} 個月的規則信號")
+
+    # 收集所有需要的股票
+    all_symbols = set([benchmark, "SHY"])
+    for m in selected_months:
+        all_symbols.update(MONTHLY_PORTFOLIOS[m]["holdings"].keys())
+
+    # 取得價格數據
+    start_date = f"{start_m}-01"
+    # 計算結束日期 (下月第一天)
+    end_year, end_month = map(int, end_m.split("-"))
+    if end_month == 12:
+        end_date = f"{end_year + 1}-01-01"
+    else:
+        end_date = f"{end_year}-{end_month + 1:02d}-01"
+
+    st.info(f"📅 回測期間: {start_date} ~ {end_date}")
+
+    prices_df = fetch_stock_prices(list(all_symbols), start_date, end_date)
+
+    if prices_df.empty:
+        st.error("無法取得股價數據")
+        return
+
+    cash_holdings = {"SHY": 1.0}
+
+    # 判斷是否比較模式
+    is_compare = strategy == "📊 兩者比較"
+    strategies_to_run = ["🛡️ 熊市防禦", "💵 熊市空手"] if is_compare else [strategy]
+
+    # 儲存兩種策略結果
+    strategy_results = {}
+
+    for strat in strategies_to_run:
+        monthly_results = []
+        all_returns = pd.Series(dtype=float)
+        bear_months = []
+
+        for m in selected_months:
+            m_info = MONTHLY_PORTFOLIOS[m]
+
+            # 根據信號來源決定 signal_score
+            if use_rule_signals and m in rule_signals:
+                signal_score = rule_signals[m]["score"]
+                signal_desc = f"[規則] {', '.join(rule_signals[m]['rules'][:2])}"
+            else:
+                signal_score = m_info["signal_score"]
+                signal_desc = m_info["signal"]
+
+            is_bear = signal_score <= cash_threshold
+
+            if is_bear and m not in bear_months:
+                bear_months.append(m)
+
+            # 計算該月日期範圍
+            year, month = map(int, m.split("-"))
+            m_start = f"{m}-01"
+            if month == 12:
+                m_end = f"{year + 1}-01-01"
+            else:
+                m_end = f"{year}-{month + 1:02d}-01"
+
+            mask = (prices_df.index >= m_start) & (prices_df.index < m_end)
+            m_prices = prices_df[mask]
+
+            if m_prices.empty:
+                continue
+
+            # 根據策略選擇持股
+            if is_bear and strat == "💵 熊市空手":
+                holdings = cash_holdings
+                status = "💵 空手"
+            else:
+                holdings = m_info["holdings"]
+                status = "🔴 防禦" if is_bear else "📈 持股"
+
+            # 計算報酬
+            port_returns = calculate_portfolio_returns(m_prices, holdings)
+            bench_returns = m_prices[benchmark].pct_change() if benchmark in m_prices.columns else pd.Series()
+
+            p_metrics = calculate_metrics(port_returns)
+            b_metrics = calculate_metrics(bench_returns)
+
+            monthly_results.append({
+                "月份": m,
+                "信號": signal_desc[:25] + "..." if len(signal_desc) > 25 else signal_desc,
+                "分數": f"{signal_score:+.1f}",
+                "狀態": status,
+                "投組": f"{p_metrics['total_return']:.1f}%",
+                benchmark: f"{b_metrics.get('total_return', 0):.1f}%",
+                "Alpha": f"{p_metrics['total_return'] - b_metrics.get('total_return', 0):+.1f}%",
+            })
+
+            all_returns = pd.concat([all_returns, port_returns])
+
+        strategy_results[strat] = {
+            "monthly_results": monthly_results,
+            "all_returns": all_returns,
+            "bear_months": bear_months
+        }
+
+    # 取得熊市月份 (兩策略相同)
+    bear_months = strategy_results[strategies_to_run[0]]["bear_months"]
+
+    # 顯示熊市月份
+    if bear_months:
+        st.warning(f"🔴 **熊市月份** (信號 ≤ {cash_threshold}): {', '.join(bear_months)}")
+
+    # 全期基準報酬
+    full_bench_returns = prices_df[benchmark].pct_change().dropna() if benchmark in prices_df.columns else pd.Series()
+    full_b_metrics = calculate_metrics(full_bench_returns)
+
+    if is_compare:
+        # ===== 比較模式 =====
+        st.markdown("### 📊 策略比較")
+
+        # 績效對比表
+        compare_data = []
+        for strat in strategies_to_run:
+            all_returns = strategy_results[strat]["all_returns"]
+            p_metrics = calculate_metrics(all_returns)
+            compare_data.append({
+                "策略": strat,
+                "總報酬": f"{p_metrics['total_return']:.1f}%",
+                "Alpha": f"{p_metrics['total_return'] - full_b_metrics['total_return']:+.1f}%",
+                "夏普比率": f"{p_metrics['sharpe']:.2f}",
+                "最大回撤": f"{p_metrics['max_drawdown']:.1f}%",
+                "波動率": f"{p_metrics['volatility']:.1f}%",
+                "勝率": f"{p_metrics['win_rate']:.0f}%",
+            })
+
+        st.dataframe(pd.DataFrame(compare_data), use_container_width=True, hide_index=True)
+
+        # 繪製比較圖表
+        st.markdown("### 📉 累積報酬走勢比較")
+        fig = go.Figure()
+
+        colors = {"🛡️ 熊市防禦": "#2196F3", "💵 熊市空手": "#4CAF50"}
+        for strat in strategies_to_run:
+            all_returns = strategy_results[strat]["all_returns"]
+            if not all_returns.empty:
+                port_cum = (1 + all_returns).cumprod()
+                fig.add_trace(go.Scatter(
+                    x=port_cum.index, y=(port_cum - 1) * 100,
+                    name=strat, line=dict(color=colors.get(strat, "#999"), width=2)
+                ))
+
+        if not full_bench_returns.empty:
+            bench_cum = (1 + full_bench_returns).cumprod()
+            fig.add_trace(go.Scatter(
+                x=bench_cum.index, y=(bench_cum - 1) * 100,
+                name=benchmark, line=dict(color="#FF9800", width=2, dash="dot")
+            ))
+
+        # 標記熊市月份
+        for m in bear_months:
+            year, month = map(int, m.split("-"))
+            m_start = f"{m}-01"
+            if month == 12:
+                m_end = f"{year + 1}-01-01"
+            else:
+                m_end = f"{year}-{month + 1:02d}-01"
+            fig.add_vrect(x0=m_start, x1=m_end, fillcolor="red", opacity=0.1, line_width=0)
+
+        fig.update_layout(
+            xaxis_title="日期", yaxis_title="累積報酬 (%)",
+            hovermode="x unified", height=400,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 月度績效比較
+        st.markdown("### 📈 月度績效比較")
+        tab1, tab2 = st.tabs(["🛡️ 熊市防禦", "💵 熊市空手"])
+        with tab1:
+            st.dataframe(pd.DataFrame(strategy_results["🛡️ 熊市防禦"]["monthly_results"]), use_container_width=True, hide_index=True)
+        with tab2:
+            st.dataframe(pd.DataFrame(strategy_results["💵 熊市空手"]["monthly_results"]), use_container_width=True, hide_index=True)
+
+    else:
+        # ===== 單一策略模式 =====
+        monthly_results = strategy_results[strategy]["monthly_results"]
+        all_returns = strategy_results[strategy]["all_returns"]
+
+        # 顯示結果
+        st.markdown("### 📈 月度績效")
+        st.dataframe(pd.DataFrame(monthly_results), use_container_width=True, hide_index=True)
+
+        # 全期績效
+        full_p_metrics = calculate_metrics(all_returns)
+
+        st.markdown("### 📊 全期績效摘要")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("投組總報酬", f"{full_p_metrics['total_return']:.1f}%")
+        with col2:
+            alpha = full_p_metrics['total_return'] - full_b_metrics['total_return']
+            st.metric("Alpha", f"{alpha:+.1f}%")
+        with col3:
+            st.metric("夏普比率", f"{full_p_metrics['sharpe']:.2f}")
+        with col4:
+            st.metric("最大回撤", f"{full_p_metrics['max_drawdown']:.1f}%")
+
+        # 繪製圖表
+        st.markdown("### 📉 累積報酬走勢")
+        fig = go.Figure()
+
+        port_cum = (1 + all_returns).cumprod()
+        fig.add_trace(go.Scatter(
+            x=port_cum.index, y=(port_cum - 1) * 100,
+            name="月度換股", line=dict(color="#2196F3", width=2)
+        ))
+
+        if not full_bench_returns.empty:
+            bench_cum = (1 + full_bench_returns).cumprod()
+            fig.add_trace(go.Scatter(
+                x=bench_cum.index, y=(bench_cum - 1) * 100,
+                name=benchmark, line=dict(color="#FF9800", width=2)
+            ))
+
+        # 標記熊市月份
+        for m in bear_months:
+            year, month = map(int, m.split("-"))
+            m_start = f"{m}-01"
+            if month == 12:
+                m_end = f"{year + 1}-01-01"
+            else:
+                m_end = f"{year}-{month + 1:02d}-01"
+            fig.add_vrect(x0=m_start, x1=m_end, fillcolor="red", opacity=0.1, line_width=0)
+
+        fig.update_layout(
+            xaxis_title="日期", yaxis_title="累積報酬 (%)",
+            hovermode="x unified", height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 持股變化表
+    st.markdown("### 📋 月度持股變化")
+    with st.expander("查看詳細持股配置"):
+        for m in selected_months:
+            m_info = MONTHLY_PORTFOLIOS[m]
+            st.markdown(f"**{m}** - {m_info['signal']}")
+            holdings_df = pd.DataFrame([
+                {"股票": s, "權重": f"{w*100:.0f}%"}
+                for s, w in sorted(m_info["holdings"].items(), key=lambda x: x[1], reverse=True)
+            ])
+            st.dataframe(holdings_df, use_container_width=True, hide_index=True)
+            st.markdown("---")
+
+
+def run_backtest(start_q: str, end_q: str, benchmark: str, strategy: str = "🛡️ 熊市防禦", cash_threshold: float = -0.2):
+    """執行回測"""
+    quarters = list(QUARTERLY_PORTFOLIOS.keys())
+    start_idx = quarters.index(start_q)
+    end_idx = quarters.index(end_q)
+    selected_quarters = quarters[start_idx:end_idx+1]
+
+    # 收集所有需要的股票
+    all_symbols = set([benchmark, "SHY"])  # 加入SHY作為現金替代
+    for q in selected_quarters:
+        all_symbols.update(QUARTERLY_PORTFOLIOS[q]["holdings"].keys())
+
+    # 取得價格數據
+    start_date = QUARTERLY_PORTFOLIOS[start_q]["start"]
+    end_date = QUARTERLY_PORTFOLIOS[end_q]["end"]
+
+    st.info(f"📅 回測期間: {start_date} ~ {end_date}")
+
+    prices_df = fetch_stock_prices(list(all_symbols), start_date, end_date)
+
+    if prices_df.empty:
+        st.error("無法取得股價數據")
+        return
+
+    # 現金配置 (用SHY代替)
+    cash_holdings = {"SHY": 1.0}
+
+    def calculate_quarter_returns(q, holdings_override=None):
+        """計算單季報酬"""
+        q_info = QUARTERLY_PORTFOLIOS[q]
+        q_start = q_info["start"]
+        q_end = q_info["end"]
+
+        mask = (prices_df.index >= q_start) & (prices_df.index <= q_end)
+        q_prices = prices_df[mask]
+
+        if q_prices.empty:
+            return None, None, None
+
+        holdings = holdings_override if holdings_override else q_info["holdings"]
+        portfolio_returns = calculate_portfolio_returns(q_prices, holdings)
+        benchmark_returns = q_prices[benchmark].pct_change() if benchmark in q_prices.columns else pd.Series()
+
+        return portfolio_returns, benchmark_returns, q_prices
+
+    # 計算每季報酬 - 支援多策略
+    quarterly_results = []
+    all_defensive_returns = pd.Series(dtype=float)  # 熊市防禦策略
+    all_cash_returns = pd.Series(dtype=float)       # 熊市空手策略
+    bear_quarters = []  # 記錄哪些季度是熊市
+
+    for q in selected_quarters:
+        q_info = QUARTERLY_PORTFOLIOS[q]
+        q_signal = QUARTER_SIGNALS.get(q, {})
+        signal_score = q_signal.get("signal_score", 0)
+
+        is_bear = signal_score <= cash_threshold
+        if is_bear:
+            bear_quarters.append(q)
+
+        # 計算防禦策略報酬 (原始配置)
+        def_returns, bench_returns, q_prices = calculate_quarter_returns(q)
+        if def_returns is None:
+            st.warning(f"{q} 無數據，跳過")
+            continue
+
+        # 計算空手策略報酬 (熊市時100%現金)
+        if is_bear:
+            cash_returns, _, _ = calculate_quarter_returns(q, cash_holdings)
+        else:
+            cash_returns = def_returns.copy()
+
+        # 計算績效
+        def_metrics = calculate_metrics(def_returns)
+        cash_metrics = calculate_metrics(cash_returns) if cash_returns is not None else {}
+        bench_metrics = calculate_metrics(bench_returns) if bench_returns is not None else {}
+
+        # 根據策略選擇顯示內容
+        if strategy == "📊 兩者比較":
+            quarterly_results.append({
+                "季度": q,
+                "信號": q_info["name"],
+                "分數": f"{signal_score:+.1f}",
+                "狀態": "🔴 熊市" if is_bear else "🟢 正常",
+                "防禦策略": f"{def_metrics['total_return']:.1f}%",
+                "空手策略": f"{cash_metrics.get('total_return', 0):.1f}%",
+                f"{benchmark}": f"{bench_metrics.get('total_return', 0):.1f}%",
+                "防禦Alpha": f"{def_metrics['total_return'] - bench_metrics.get('total_return', 0):+.1f}%",
+                "空手Alpha": f"{cash_metrics.get('total_return', 0) - bench_metrics.get('total_return', 0):+.1f}%",
+            })
+        else:
+            # 單一策略
+            if strategy == "💵 熊市空手":
+                p_metrics = cash_metrics
+                p_returns = cash_returns
+            else:
+                p_metrics = def_metrics
+                p_returns = def_returns
+
+            quarterly_results.append({
+                "季度": q,
+                "決策信號": q_info["name"],
+                "信號分數": f"{signal_score:+.1f}",
+                "狀態": "🔴 空手" if (is_bear and strategy == "💵 熊市空手") else ("🛡️ 防禦" if is_bear else "📈 持股"),
+                "投組報酬": f"{p_metrics['total_return']:.1f}%",
+                f"{benchmark}": f"{bench_metrics.get('total_return', 0):.1f}%",
+                "Alpha": f"{p_metrics['total_return'] - bench_metrics.get('total_return', 0):+.1f}%",
+                "最大回撤": f"{p_metrics['max_drawdown']:.1f}%",
+            })
+
+        # 累積報酬
+        all_defensive_returns = pd.concat([all_defensive_returns, def_returns])
+        all_cash_returns = pd.concat([all_cash_returns, cash_returns])
+
+    # 顯示熊市季度
+    if bear_quarters:
+        st.warning(f"🔴 **熊市季度** (信號 ≤ {cash_threshold}): {', '.join(bear_quarters)}")
+
+    # 顯示季度結果
+    st.header("📈 季度績效比較")
+    st.dataframe(pd.DataFrame(quarterly_results), use_container_width=True, hide_index=True)
+
+    # 計算全期績效
+    st.divider()
+    st.header("📊 全期績效摘要")
+
+    # 取得全期基準報酬
+    full_benchmark_returns = prices_df[benchmark].pct_change().dropna() if benchmark in prices_df.columns else pd.Series()
+
+    full_def_metrics = calculate_metrics(all_defensive_returns)
+    full_cash_metrics = calculate_metrics(all_cash_returns)
+    full_b_metrics = calculate_metrics(full_benchmark_returns)
+
+    if strategy == "📊 兩者比較":
+        # 比較模式 - 顯示兩種策略
+        st.markdown("### 策略績效比較")
+
+        comparison_data = {
+            "指標": ["總報酬", "年化報酬", "夏普比率", "波動率", "最大回撤", "勝率"],
+            "🛡️ 熊市防禦": [
+                f"{full_def_metrics['total_return']:.1f}%",
+                f"{full_def_metrics['annualized_return']:.1f}%",
+                f"{full_def_metrics['sharpe']:.2f}",
+                f"{full_def_metrics['volatility']:.1f}%",
+                f"{full_def_metrics['max_drawdown']:.1f}%",
+                f"{full_def_metrics['win_rate']:.1f}%",
+            ],
+            "💵 熊市空手": [
+                f"{full_cash_metrics['total_return']:.1f}%",
+                f"{full_cash_metrics['annualized_return']:.1f}%",
+                f"{full_cash_metrics['sharpe']:.2f}",
+                f"{full_cash_metrics['volatility']:.1f}%",
+                f"{full_cash_metrics['max_drawdown']:.1f}%",
+                f"{full_cash_metrics['win_rate']:.1f}%",
+            ],
+            f"{benchmark}": [
+                f"{full_b_metrics['total_return']:.1f}%",
+                f"{full_b_metrics['annualized_return']:.1f}%",
+                f"{full_b_metrics['sharpe']:.2f}",
+                f"{full_b_metrics['volatility']:.1f}%",
+                f"{full_b_metrics['max_drawdown']:.1f}%",
+                f"{full_b_metrics['win_rate']:.1f}%",
+            ],
+        }
+        st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
+
+        # 勝者判定
+        def_alpha = full_def_metrics['total_return'] - full_b_metrics['total_return']
+        cash_alpha = full_cash_metrics['total_return'] - full_b_metrics['total_return']
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🛡️ 防禦 Alpha", f"{def_alpha:+.1f}%")
+        with col2:
+            st.metric("💵 空手 Alpha", f"{cash_alpha:+.1f}%")
+        with col3:
+            winner = "💵 熊市空手" if cash_alpha > def_alpha else "🛡️ 熊市防禦"
+            diff = abs(cash_alpha - def_alpha)
+            st.metric("勝者", winner, delta=f"+{diff:.1f}%")
+
+    else:
+        # 單一策略模式
+        if strategy == "💵 熊市空手":
+            full_p_metrics = full_cash_metrics
+        else:
+            full_p_metrics = full_def_metrics
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("投組總報酬", f"{full_p_metrics['total_return']:.1f}%")
+            st.metric(f"{benchmark}總報酬", f"{full_b_metrics['total_return']:.1f}%")
+        with col2:
+            alpha = full_p_metrics['total_return'] - full_b_metrics['total_return']
+            st.metric("超額報酬 (Alpha)", f"{alpha:.1f}%",
+                      delta=f"{'勝' if alpha > 0 else '負'}")
+            st.metric("年化報酬", f"{full_p_metrics['annualized_return']:.1f}%")
+        with col3:
+            st.metric("夏普比率", f"{full_p_metrics['sharpe']:.2f}")
+            st.metric("波動率", f"{full_p_metrics['volatility']:.1f}%")
+        with col4:
+            st.metric("最大回撤", f"{full_p_metrics['max_drawdown']:.1f}%")
+            st.metric("勝率", f"{full_p_metrics['win_rate']:.1f}%")
+
+    # 繪製累積報酬圖
+    st.divider()
+    st.header("📉 累積報酬走勢")
+
+    fig = go.Figure()
+
+    # 防禦策略累積
+    if strategy in ["🛡️ 熊市防禦", "📊 兩者比較"]:
+        defensive_cum = (1 + all_defensive_returns).cumprod()
+        fig.add_trace(go.Scatter(
+            x=defensive_cum.index,
+            y=(defensive_cum - 1) * 100,
+            name="🛡️ 熊市防禦",
+            line=dict(color="#2196F3", width=2),
+        ))
+
+    # 空手策略累積
+    if strategy in ["💵 熊市空手", "📊 兩者比較"]:
+        cash_cum = (1 + all_cash_returns).cumprod()
+        fig.add_trace(go.Scatter(
+            x=cash_cum.index,
+            y=(cash_cum - 1) * 100,
+            name="💵 熊市空手",
+            line=dict(color="#4CAF50", width=2),
+        ))
+
+    # 基準累積
+    if not full_benchmark_returns.empty:
+        benchmark_cum = (1 + full_benchmark_returns).cumprod()
+        fig.add_trace(go.Scatter(
+            x=benchmark_cum.index,
+            y=(benchmark_cum - 1) * 100,
+            name=f"{benchmark}",
+            line=dict(color="#FF9800", width=2),
+        ))
+
+    # 標記熊市季度
+    for q in bear_quarters:
+        q_start = QUARTERLY_PORTFOLIOS[q]["start"]
+        q_end = QUARTERLY_PORTFOLIOS[q]["end"]
+        fig.add_vrect(x0=q_start, x1=q_end, fillcolor="red", opacity=0.1, line_width=0)
+
+    # 標記季度分界
+    for q in selected_quarters:
+        q_start = QUARTERLY_PORTFOLIOS[q]["start"]
+        fig.add_vline(x=q_start, line_dash="dash", line_color="gray", opacity=0.5)
+        fig.add_annotation(x=q_start, y=1.05, yref="paper", text=q, showarrow=False, font=dict(size=10))
+
+    fig.update_layout(
+        title="累積報酬率 (%)",
+        xaxis_title="日期",
+        yaxis_title="累積報酬 (%)",
+        hovermode="x unified",
+        height=500,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 顯示持股配置與決策信號
+    st.divider()
+    st.header("📋 各季決策信號與持股配置")
+
+    for q in selected_quarters:
+        q_info = QUARTERLY_PORTFOLIOS[q]
+        q_signal = QUARTER_SIGNALS.get(q, {})
+        signal_score = q_signal.get("signal_score", 0)
+
+        # 根據信號分數決定顏色
+        if signal_score >= 0.5:
+            signal_color = "🟢"
+        elif signal_score >= 0.2:
+            signal_color = "🟡"
+        elif signal_score >= -0.2:
+            signal_color = "⚪"
+        elif signal_score >= -0.5:
+            signal_color = "🟠"
+        else:
+            signal_color = "🔴"
+
+        with st.expander(f"{signal_color} **{q}** - {q_info['name']} (信號: {signal_score:+.1f})"):
+            # 顯示季初可得信號
+            st.markdown("##### 📡 季初決策信號 (季初第一天可得資訊)")
+            signal_text = q_info.get("signal", "")
+            st.info(f"**{signal_text}**")
+
+            if q_signal:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown(f"**Fed態度**: {q_signal.get('fed_stance', '—')}")
+                    st.markdown(f"**殖利率曲線**: {q_signal.get('yield_curve', '—')}")
+                with col2:
+                    st.markdown(f"**CPI趨勢**: {q_signal.get('cpi_trend', '—')}")
+                    st.markdown(f"**SPY vs 200MA**: {q_signal.get('spy_vs_200ma', '—')}")
+                with col3:
+                    st.markdown(f"**VIX**: {q_signal.get('vix', '—')}")
+                    if q_signal.get('ai_momentum'):
+                        st.markdown(f"**AI動能**: {q_signal.get('ai_momentum')}")
+
+            st.markdown("##### 💼 持股配置")
+            st.markdown(f"**期間**: {q_info['start']} ~ {q_info['end']}")
+
+            holdings_df = pd.DataFrame([
+                {"股票": s, "權重": f"{w*100:.0f}%", "公司": STOCK_DETAILS.get(s, {}).get("name", s)}
+                for s, w in sorted(q_info["holdings"].items(), key=lambda x: x[1], reverse=True)
+            ])
+            st.dataframe(holdings_df, use_container_width=True, hide_index=True)
+
+    # 風險提示
+    st.divider()
+    st.warning("""
+    ⚠️ **免責聲明**
+
+    此回測結果僅供參考，不構成投資建議。
+    - 過去績效不代表未來表現
+    - 回測未考慮交易成本、滑點、稅費
+    - 實際執行可能有流動性問題
+    - 請謹慎評估自身風險承受度
+    """)
+
+
+# ========== 個股深度分析頁面 ==========
+FOCUS_STOCKS = {
+    "AAPL": {"name": "Apple", "sector": "科技", "description": "消費電子與服務巨頭，iPhone、Mac、服務生態系"},
+    "INTC": {"name": "Intel", "sector": "半導體", "description": "CPU 製造商，正在轉型晶圓代工"},
+    "PLTR": {"name": "Palantir", "sector": "軟體/AI", "description": "大數據分析平台，政府與企業 AI 解決方案"},
+    "LITE": {"name": "Lumentum", "sector": "光學/光子", "description": "光學與光子產品，3D 感測、光通訊"},
+}
+
+
+def render_individual_stock_page(selected_date: date):
+    """渲染個股深度分析頁面"""
+    st.title("🔬 個股深度分析")
+
+    # 股票選擇
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        selected_symbol = st.selectbox(
+            "選擇股票",
+            list(FOCUS_STOCKS.keys()),
+            format_func=lambda x: f"{x} - {FOCUS_STOCKS[x]['name']}"
+        )
+
+    stock_info = FOCUS_STOCKS[selected_symbol]
+
+    with col2:
+        st.markdown(f"""
+        ### {selected_symbol} - {stock_info['name']}
+        **產業**: {stock_info['sector']} | {stock_info['description']}
+        """)
+
+    st.divider()
+
+    # ========== 取得股價數據 ==========
+    end_date = date.today()
+    start_date = end_date - timedelta(days=365)
+
+    # 使用 yfinance 取得最新數據
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(selected_symbol)
+        df = ticker.history(start=start_date, end=end_date)
+        df = df.reset_index()
+        df.columns = [c.lower() for c in df.columns]
+
+        if df.empty:
+            st.warning(f"無法取得 {selected_symbol} 的股價數據")
+            return
+
+        # 計算技術指標
+        df['ma20'] = df['close'].rolling(window=20).mean()
+        df['ma50'] = df['close'].rolling(window=50).mean()
+        df['ma200'] = df['close'].rolling(window=200).mean()
+
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        # MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['signal']
+
+        # 布林通道
+        df['bb_mid'] = df['close'].rolling(window=20).mean()
+        df['bb_std'] = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['bb_mid'] + 2 * df['bb_std']
+        df['bb_lower'] = df['bb_mid'] - 2 * df['bb_std']
+
+    except Exception as e:
+        st.error(f"取得股價數據時發生錯誤: {e}")
+        return
+
+    # ========== 關鍵指標卡片 ==========
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else latest
+
+    price_change = latest['close'] - prev['close']
+    price_change_pct = (price_change / prev['close']) * 100
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric(
+            "收盤價",
+            f"${latest['close']:.2f}",
+            f"{price_change:+.2f} ({price_change_pct:+.2f}%)"
+        )
+    with col2:
+        st.metric("成交量", f"{latest['volume']/1e6:.1f}M")
+    with col3:
+        rsi_val = latest['rsi']
+        rsi_status = "超買" if rsi_val > 70 else ("超賣" if rsi_val < 30 else "中性")
+        st.metric("RSI (14)", f"{rsi_val:.1f}", rsi_status)
+    with col4:
+        macd_val = latest['macd']
+        macd_signal = "多頭" if macd_val > latest['signal'] else "空頭"
+        st.metric("MACD", f"{macd_val:.2f}", macd_signal)
+    with col5:
+        # 計算距離 52 週高低
+        high_52w = df['high'].tail(252).max()
+        low_52w = df['low'].tail(252).min()
+        pct_from_high = ((latest['close'] - high_52w) / high_52w) * 100
+        st.metric("距52週高", f"{pct_from_high:.1f}%", f"${high_52w:.2f}")
+
+    st.divider()
+
+    # ========== 圖表區域 ==========
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 價格走勢", "📊 技術指標", "📰 相關新聞", "🎯 分析總結"])
+
+    with tab1:
+        # K線圖 + 均線
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.7, 0.3],
+            subplot_titles=("價格與均線", "成交量")
+        )
+
+        # K線
+        fig.add_trace(go.Candlestick(
+            x=df['date'],
+            open=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name='K線'
+        ), row=1, col=1)
+
+        # 均線
+        fig.add_trace(go.Scatter(x=df['date'], y=df['ma20'], name='MA20', line=dict(color='orange', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['date'], y=df['ma50'], name='MA50', line=dict(color='blue', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['date'], y=df['ma200'], name='MA200', line=dict(color='red', width=1)), row=1, col=1)
+
+        # 布林通道
+        fig.add_trace(go.Scatter(x=df['date'], y=df['bb_upper'], name='BB Upper', line=dict(color='gray', dash='dash', width=0.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['date'], y=df['bb_lower'], name='BB Lower', line=dict(color='gray', dash='dash', width=0.5), fill='tonexty', fillcolor='rgba(128,128,128,0.1)'), row=1, col=1)
+
+        # 成交量
+        colors = ['red' if row['close'] < row['open'] else 'green' for _, row in df.iterrows()]
+        fig.add_trace(go.Bar(x=df['date'], y=df['volume'], name='成交量', marker_color=colors), row=2, col=1)
+
+        fig.update_layout(
+            height=600,
+            xaxis_rangeslider_visible=False,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        # RSI + MACD 圖
+        fig2 = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.1,
+            subplot_titles=("RSI (14)", "MACD")
+        )
+
+        # RSI
+        fig2.add_trace(go.Scatter(x=df['date'], y=df['rsi'], name='RSI', line=dict(color='purple')), row=1, col=1)
+        fig2.add_hline(y=70, line_dash="dash", line_color="red", row=1, col=1)
+        fig2.add_hline(y=30, line_dash="dash", line_color="green", row=1, col=1)
+
+        # MACD
+        fig2.add_trace(go.Scatter(x=df['date'], y=df['macd'], name='MACD', line=dict(color='blue')), row=2, col=1)
+        fig2.add_trace(go.Scatter(x=df['date'], y=df['signal'], name='Signal', line=dict(color='orange')), row=2, col=1)
+        colors_macd = ['green' if v > 0 else 'red' for v in df['macd_hist']]
+        fig2.add_trace(go.Bar(x=df['date'], y=df['macd_hist'], name='Histogram', marker_color=colors_macd), row=2, col=1)
+
+        fig2.update_layout(height=500, showlegend=True)
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with tab3:
+        # 相關新聞
+        st.markdown("#### 📰 近期相關新聞")
+
+        # 搜尋關鍵字
+        search_keywords = {
+            "AAPL": ["apple", "iphone", "aapl", "tim cook"],
+            "INTC": ["intel", "intc", "pat gelsinger", "foundry"],
+            "PLTR": ["palantir", "pltr", "alex karp"],
+            "LITE": ["lumentum", "lite", "optical", "photonics"],
+        }
+
+        keywords = search_keywords.get(selected_symbol, [selected_symbol.lower()])
+
+        # 取得相關新聞 - 使用統一資料層
+        related_news = []
+        try:
+            client = _get_data_client()
+            for kw in keywords[:2]:  # 限制關鍵字數量
+                results = client.search_news(kw, limit=10)
+                related_news.extend(results)
+        except Exception as e:
+            pass
+
+        # 去重
+        seen_titles = set()
+        unique_news = []
+        for n in related_news:
+            if n["title"] not in seen_titles:
+                seen_titles.add(n["title"])
+                unique_news.append(n)
+
+        if unique_news:
+            for news in unique_news[:15]:
+                pub_date = news.get("published_at", "")[:10] if news.get("published_at") else ""
+                source = news.get("source", "")
+                st.markdown(f"**{pub_date}** | {source}")
+                st.markdown(f"[{news['title']}]({news.get('url', '#')})")
+                st.markdown("---")
+        else:
+            st.info("暫無相關新聞")
+
+    with tab4:
+        # 技術分析總結
+        st.markdown("#### 🎯 技術分析總結")
+
+        # 趨勢判斷
+        trend_signals = []
+        if latest['close'] > latest['ma20']:
+            trend_signals.append("✅ 股價在 MA20 之上 (短期多頭)")
+        else:
+            trend_signals.append("❌ 股價在 MA20 之下 (短期空頭)")
+
+        if latest['close'] > latest['ma50']:
+            trend_signals.append("✅ 股價在 MA50 之上 (中期多頭)")
+        else:
+            trend_signals.append("❌ 股價在 MA50 之下 (中期空頭)")
+
+        if latest['close'] > latest['ma200']:
+            trend_signals.append("✅ 股價在 MA200 之上 (長期多頭)")
+        else:
+            trend_signals.append("❌ 股價在 MA200 之下 (長期空頭)")
+
+        if latest['ma20'] > latest['ma50']:
+            trend_signals.append("✅ MA20 > MA50 (黃金交叉形態)")
+        else:
+            trend_signals.append("⚠️ MA20 < MA50 (死亡交叉形態)")
+
+        # RSI 判斷
+        if rsi_val > 70:
+            trend_signals.append("⚠️ RSI > 70 (超買區，可能回調)")
+        elif rsi_val < 30:
+            trend_signals.append("🟢 RSI < 30 (超賣區，可能反彈)")
+        else:
+            trend_signals.append("⚪ RSI 在中性區間")
+
+        # MACD 判斷
+        if latest['macd'] > latest['signal']:
+            trend_signals.append("✅ MACD 在信號線之上 (多頭動能)")
+        else:
+            trend_signals.append("❌ MACD 在信號線之下 (空頭動能)")
+
+        # 布林通道判斷
+        if latest['close'] > latest['bb_upper']:
+            trend_signals.append("⚠️ 股價突破布林上軌 (可能超漲)")
+        elif latest['close'] < latest['bb_lower']:
+            trend_signals.append("🟢 股價跌破布林下軌 (可能超跌)")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**趨勢信號**")
+            for signal in trend_signals:
+                st.markdown(signal)
+
+        with col2:
+            # 綜合評分
+            bullish_count = sum(1 for s in trend_signals if s.startswith("✅") or s.startswith("🟢"))
+            bearish_count = sum(1 for s in trend_signals if s.startswith("❌") or s.startswith("⚠️"))
+            total = bullish_count + bearish_count
+
+            if total > 0:
+                score = (bullish_count / total) * 100
+
+                st.markdown("**綜合評分**")
+                if score >= 70:
+                    st.success(f"🟢 偏多 ({score:.0f}分)")
+                    st.markdown("技術面偏多頭，但仍需注意風險管理")
+                elif score >= 40:
+                    st.warning(f"🟡 中性 ({score:.0f}分)")
+                    st.markdown("多空交戰，建議觀望或輕倉")
+                else:
+                    st.error(f"🔴 偏空 ({score:.0f}分)")
+                    st.markdown("技術面偏空頭，建議謹慎操作")
+
+            # 支撐壓力
+            st.markdown("**關鍵價位**")
+            st.markdown(f"- 支撐: ${latest['bb_lower']:.2f} (布林下軌)")
+            st.markdown(f"- 壓力: ${latest['bb_upper']:.2f} (布林上軌)")
+            st.markdown(f"- 52週高: ${high_52w:.2f}")
+            st.markdown(f"- 52週低: ${low_52w:.2f}")
 
 
 def render_stock_page(selected_date: date):
@@ -4415,14 +8117,16 @@ def render_sentiment_backtest_page():
 st.sidebar.title("📈 股票與新聞分析")
 st.sidebar.markdown("---")
 
-# 示範模式提示
-if DEMO_MODE:
+# Supabase 模式提示
+if USE_SUPABASE:
+    st.sidebar.success("☁️ **Supabase 雲端資料庫**")
+elif DEMO_MODE:
     st.sidebar.info("📌 **示範模式**\n使用有限的示範數據")
     st.toast("正在使用示範資料庫，數據有限", icon="ℹ️")
 
 # 檢查資料庫是否存在
-db_exists = DB_PATH.exists()
-finance_db_exists = FINANCE_DB_PATH.exists()
+db_exists = DB_PATH.exists() or USE_SUPABASE
+finance_db_exists = FINANCE_DB_PATH.exists() or USE_SUPABASE
 
 if not db_exists and not finance_db_exists:
     st.error("⚠️ 資料庫檔案不存在")
@@ -4443,10 +8147,10 @@ if not db_exists and not finance_db_exists:
 st.sidebar.subheader("📅 選擇日期")
 
 # 安全取得可用日期
-if db_exists:
+if USE_SUPABASE or db_exists:
     try:
         available_dates = get_available_dates()
-    except Exception:
+    except Exception as e:
         available_dates = []
 else:
     available_dates = []
@@ -4455,22 +8159,38 @@ if available_dates:
     min_date = min(available_dates)
     max_date = max(available_dates)
 
+    # 初始化 session_state 中的日期
+    if "selected_date" not in st.session_state:
+        st.session_state.selected_date = max_date
+
+    # 快速選擇按鈕的回調函數
+    def set_today():
+        st.session_state.selected_date = date.today()
+
+    def set_yesterday():
+        st.session_state.selected_date = date.today() - timedelta(days=1)
+
+    # 日期選擇器（使用 session_state）
     selected_date = st.sidebar.date_input(
         "日期",
-        value=max_date,
+        value=st.session_state.selected_date,
         min_value=min_date,
         max_value=max_date,
-        format="YYYY-MM-DD"
+        format="YYYY-MM-DD",
+        key="date_picker"
     )
+    # 同步更新 session_state
+    st.session_state.selected_date = selected_date
 
     st.sidebar.markdown("**快速選擇:**")
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        if st.button("今天", use_container_width=True):
-            selected_date = date.today()
+        st.button("今天", use_container_width=True, on_click=set_today)
     with col2:
-        if st.button("昨天", use_container_width=True):
-            selected_date = date.today() - timedelta(days=1)
+        st.button("昨天", use_container_width=True, on_click=set_yesterday)
+
+    # 使用 session_state 的值
+    selected_date = st.session_state.selected_date
 
     st.sidebar.markdown(f"*資料範圍: {min_date} ~ {max_date}*")
 else:
@@ -4495,6 +8215,36 @@ else:
 
     收集完成後重新整理頁面即可。
     """)
+
+st.sidebar.markdown("---")
+
+# ========== 新聞篩選設定 ==========
+st.sidebar.subheader("🔍 新聞篩選")
+
+# PTT 最低推文數
+if "ptt_min_push" not in st.session_state:
+    st.session_state.ptt_min_push = 30
+
+ptt_min_push = st.sidebar.slider(
+    "PTT 最低推文數",
+    min_value=0,
+    max_value=100,
+    value=st.session_state.ptt_min_push,
+    step=10,
+    help="只顯示推文數 >= 此值的 PTT 文章"
+)
+st.session_state.ptt_min_push = ptt_min_push
+
+# 排除社論
+if "exclude_editorial" not in st.session_state:
+    st.session_state.exclude_editorial = True
+
+exclude_editorial = st.sidebar.checkbox(
+    "排除社論/評論",
+    value=st.session_state.exclude_editorial,
+    help="過濾掉個人評論、社論、專欄類文章"
+)
+st.session_state.exclude_editorial = exclude_editorial
 
 st.sidebar.markdown("---")
 
@@ -4530,7 +8280,7 @@ st.sidebar.markdown("---")
 
 page = st.sidebar.radio(
     "選擇頁面",
-    ["📊 新聞總結", "📈 股票數據", "🎯 交易分析", "🌍 總經分析", "📉 情緒回測", "📋 股票清單", "📰 新聞列表", "🇹🇼 PTT Stock"],
+    ["📊 新聞總結", "🎯 趨勢雷達", "💰 季度回測", "🔬 個股分析", "📈 股票數據", "🎯 交易分析", "🌍 總經分析", "📉 情緒回測", "📋 股票清單", "📰 新聞列表", "🇹🇼 PTT Stock"],
     index=0
 )
 
@@ -4544,6 +8294,12 @@ if st.sidebar.button("🔄 重新整理", use_container_width=True):
 # ========== 頁面路由 ==========
 if page == "📊 新聞總結":
     render_summary_page(selected_date)
+elif page == "🎯 趨勢雷達":
+    render_trend_radar_page()
+elif page == "💰 季度回測":
+    render_quarterly_backtest_page()
+elif page == "🔬 個股分析":
+    render_individual_stock_page(selected_date)
 elif page == "📈 股票數據":
     render_stock_page(selected_date)
 elif page == "🎯 交易分析":
